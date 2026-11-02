@@ -299,3 +299,5 @@ starts from defaults.
 * `plc_protocol`'s old `request*()` / `desired()` API is unused but still present.
 * The 140 ms blocking reply delay in `plc_protocol` slows UI refresh.
 * All work is uncommitted on `espidf-migration`.
+#   C e n d o r i R c  
+ 
