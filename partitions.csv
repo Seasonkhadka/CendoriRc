@@ -1,0 +1,7 @@
+# 8 MB flash. NVS and phy_init keep their old offsets, so saved settings
+# survive the change. The app partition grows from 1 MB to 3 MB for the
+# Wi-Fi stack, the setup web portal and (later) TLS for the server upload.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+factory,   app,  factory, 0x10000,  0x300000

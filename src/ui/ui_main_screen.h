@@ -13,12 +13,17 @@ namespace ui_main_screen {
 lv_obj_t *create(lv_obj_t *parent);
 
 // --- AQI / comfort card ---
-void set_aqi(int aqi, const char *label);                  // e.g. 32, "쾌적"
+// Air-quality index 0-100 (-1 = no reading, "--"), level label and colour.
+void set_aqi(int aqi, const char *label, uint32_t color);
 void set_indoor(float temp_c, int humidity_pct);
 
 // --- Heat-recovery card ---
-void set_fan_supply(int level_pct, const char *level_label);  // 급기
-void set_fan_exhaust(int level_pct, const char *level_label); // 배기
 void set_humidify_reservation(int hour24, int minute);
+
+// Live RC state: mode badge, fan level 0-3, and the active-state VSP
+// (0.05 V units; 0 = fan stopped / no voltage).
+void set_mode_badge(const char *text);
+void set_fan_level(int level);
+void set_fan_vsp(int supply_units, int exhaust_units);
 
 } // namespace ui_main_screen

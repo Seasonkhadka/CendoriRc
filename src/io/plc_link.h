@@ -17,13 +17,15 @@
  * role from ahu_link/ahu_protocol, which act as master against
  * MainControl's separate RS-485 port.
  *
- * Listen only: UART2 RX on GPIO20. GPIO19 (Q5) is held LOW so it does
- * not load PLC+ / 5V. Do not attach UART TX to GPIO19 while powered
- * from J1 — idle-high TX turns Q5 on and the LCD goes blank.
+ * RX is always on GPIO20. GPIO19 (Q5) stays a GPIO LOW except for the
+ * short window in sendBytes() - idle-high UART TX on 19 would load PLC+
+ * and blank the LCD.
  */
 #pragma once
 
-#include <Arduino.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 namespace plc_link {
 
@@ -33,17 +35,32 @@ void holdQ5Off();
 
 void init();
 
-// Non-blocking: call every loop() iteration. Drains whatever bytes are
-// currently available on UART2 and logs them (hex + a relative
-// timestamp), starting a new log line whenever there's a gap since the
-// last byte, so real traffic bursts/timing are visible without assuming
-// a frame length up front.
-void poll();
+// Non-blocking: pulls one raw byte off UART2 if available, along with the
+// esp_timer_get_time() timestamp of when a dedicated UART event task saw it
+// arrive (not when this function happened to be called) - so gaps computed
+// from tsUs reflect real wire timing even if the caller's poll loop runs
+// much slower than the baud rate and bytes queue up between calls.
+// plc_protocol.cpp owns frame sync/parsing.
+bool readTimedByte(uint8_t *out, int64_t *tsUs);
 
-// True once a byte has been seen on PLC-RX within the last kLinkTimeoutMs
-// (see .cpp). This is just "is something toggling the PLC-RX line right
-// now" - not a real frame/protocol check yet - so it is a presence
-// heuristic, not proof MainControl is polling us correctly.
-bool isConnected();
+// Bind GPIO19 to UART2 TX, write, wait, then GPIO19 LOW again.
+// Only call from a D5/E5 reply - not idle.
+bool sendBytes(const uint8_t *data, size_t n);
+
+// Raw GPIO20 level, independent of whatever UART2 last decoded - for the
+// protocol provider's RX idle-state check (1 = HIGH = standard non-inverted
+// UART idle). init() logs this once right away; callers can sample it again
+// later once the bus has had time to settle.
+int rxPinLevel();
+
+// Cumulative count of bytes actually pulled off the UART2 driver via
+// uart_read_bytes() inside uartEventTask - the lowest-level point in this
+// codebase where a byte is confirmed to have reached the peripheral/driver,
+// independent of the ring buffer or plc_protocol's burst grouping. Compare
+// against plc_protocol's own cumulative "bytes appended to a burst" count
+// to tell apart "the byte never reached the UART peripheral" (hardware/line
+// issue) from "our own pipeline dropped or misplaced a byte that did
+// arrive" (our bug).
+uint32_t uartBytesReadCount();
 
 } // namespace plc_link

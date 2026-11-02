@@ -9,11 +9,21 @@
 #include "ui_theme.h"
 #include "ui_icons.h"
 #include "fonts/ui_fonts.h"
-#include "io/ahu_protocol.h"
+#include "rc/RcConfig.h"
+#include "rc/RcController.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <string>
+
+#include "io/sensors.h"
+#include "net/WifiController.h"
+#include "nvs.h"
+#include "rs485/Rs485Config.h"
+#include "ui_lang.h"
 
 using namespace ui_theme;
+using ui_lang::tr;
 
 namespace ui_settings_screen {
 
@@ -27,35 +37,43 @@ void refresh_content();
 
 namespace {
 
-constexpr int kMenuCount = 5;
+constexpr int kMenuCount = 7;
 
 struct MenuItem {
-  const char *title;
-  const char *subtitle;
+  const char *title;    // Korean title
+  const char *subtitle; // "(English)" under the Korean title
+  const char *title_en; // English title (English UI, no subtitle)
   bool enabled; // false = greyed out / not yet available
   bool locked;  // true = show a lock icon (password-protected section)
 };
 
 const MenuItem kMenu[kMenuCount] = {
-    {"풍량 설정", "(Airflow)", true, false},
-    {"예약 설정", "(Schedule)", true, false},
-    {"네트워크 설정", "(Wi-Fi)", true, false},
-    {"기기 설정", "(Engineer Mode)", true, true},
-    {"필터 상태", "(Filter)", true, false},
+    {"풍량 설정", "(Airflow)", "Airflow", true, false},
+    {"예약 설정", "(Schedule)", "Schedule", true, false},
+    {"네트워크 설정", "(Wi-Fi)", "Wi-Fi", true, false},
+    {"필터 상태", "(Filter)", "Filter", true, false},
+    {"시간 설정", "(Clock)", "Clock", true, false},
+    {"언어 설정", "(Language)", "Language", true, false},
+    {"기기 설정", "(Engineer Mode)", "Engineer Mode", true, true},
 };
 
-// Engineer Mode is a locked sub-area with its own nested sidebar (2 items)
+// Engineer Mode is a locked sub-area with its own nested sidebar (3 items)
 // and its own content panel per item - selecting it in the outer sidebar
 // shows a simple "portal" panel; pressing OK on that portal drills in.
-constexpr int kEngMenuCount = 2;
+constexpr int kEngMenuCount = 3;
 struct EngMenuItem {
   const char *title;
   const char *subtitle;
+  const char *title_en;
 };
 const EngMenuItem kEngMenu[kEngMenuCount] = {
-    {"ID 설정", "(RS-485 ID)"},
-    {"VSP 설정", "(Motor VSP)"},
+    {"ID 설정", "(Device ID)", "Device ID"},
+    {"VSP 설정", "(Motor VSP)", "Motor VSP"},
+    {"PIN 설정", "(Change PIN)", "Change PIN"},
 };
+
+const char *menu_title(int i) { return tr(kMenu[i].title, kMenu[i].title_en); }
+const char *eng_menu_title(int i) { return tr(kEngMenu[i].title, kEngMenu[i].title_en); }
 
 enum class Mode { Outer, Engineer };
 Mode s_mode = Mode::Outer;
@@ -64,6 +82,21 @@ lv_obj_t *s_breadcrumbRoot = nullptr;
 lv_obj_t *s_breadcrumbSection = nullptr;
 lv_obj_t *s_breadcrumbLock = nullptr;
 lv_obj_t *s_breadcrumbWifi = nullptr;
+lv_obj_t *s_breadcrumbTime = nullptr;
+// Wi-Fi state, pushed in through set_wifi_state().
+WifiDto s_wifi;
+// Wi-Fi panel page while editing it: status / QR setup / network list /
+// password keyboard. Outside the panel it always shows the status page.
+enum class WifiView { Main, Qr, Scan, Keyboard };
+WifiView s_wifiView = WifiView::Main;
+int s_wifiSel = 0;          // network list selection (index apCount = "rescan")
+char s_kbSsid[33] = "";     // network the keyboard types a password for
+std::string s_kbText;       // password typed so far
+int s_kbPage = 0;           // 0 abc / 1 ABC / 2 #+=
+int s_kbRow = 0, s_kbCol = 0;
+// Current RTC time, pushed in through set_time() (Schedule "acts at" line).
+bool s_clockValid = false;
+int s_clockY = 2026, s_clockMo = 1, s_clockD = 1, s_clockH = 0, s_clockM = 0;
 
 lv_obj_t *s_sidebarSlot = nullptr; // rebuilt on Outer <-> Engineer switch
 lv_obj_t *s_menuCards[kMenuCount] = {};
@@ -75,7 +108,58 @@ lv_obj_t *s_engMenuSubtitles[kEngMenuCount] = {};
 
 lv_obj_t *s_contentPanel = nullptr;
 int s_selected = 0;    // outer sidebar index (0-4)
-int s_engSelected = 0; // engineer sub-sidebar index (0-1), while s_mode == Engineer
+int s_engSelected = 0; // engineer sub-sidebar index (0-2), while s_mode == Engineer
+bool s_pinOpen = false;
+int s_pinPos = 0;
+int s_pinDigit[4] = {};
+bool s_pinWrong = false;
+int s_savedPin = RC_ENGINEER_PIN;
+
+int clamp_pin(int v) {
+  if (v < 0) return 0;
+  if (v > 9999) return 9999;
+  return v;
+}
+
+void digits_from_pin(int pin, int d[4]) {
+  pin = clamp_pin(pin);
+  d[0] = pin / 1000;
+  d[1] = (pin / 100) % 10;
+  d[2] = (pin / 10) % 10;
+  d[3] = pin % 10;
+}
+
+int pin_from_digits(const int d[4]) {
+  return clamp_pin(d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[3]);
+}
+
+void load_pin() {
+  nvs_handle_t h;
+  if (nvs_open("ui", NVS_READONLY, &h) != ESP_OK) return;
+  uint16_t v = 0;
+  if (nvs_get_u16(h, "eng_pin", &v) == ESP_OK) s_savedPin = clamp_pin((int)v);
+  nvs_close(h);
+}
+
+void save_pin(int pin) {
+  s_savedPin = clamp_pin(pin);
+  nvs_handle_t h;
+  if (nvs_open("ui", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u16(h, "eng_pin", (uint16_t)s_savedPin);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+void pin_reset() {
+  s_pinOpen = false;
+  s_pinPos = 0;
+  s_pinWrong = false;
+  s_pinDigit[0] = s_pinDigit[1] = s_pinDigit[2] = s_pinDigit[3] = 0;
+}
+
+bool pin_matches() {
+  return pin_from_digits(s_pinDigit) == s_savedPin;
+}
 
 // Right-panel edit session. While s_in_panel is true, arrows change the
 // working copy (s_data). s_snap is the last saved copy; Back restores it.
@@ -83,22 +167,25 @@ bool s_in_panel = false;
 int s_panel_row = 0;
 
 struct SettingsData {
-  // AHU live control (RS-485, ahu_protocol.h) - these mirror the last
-  // CONFIRMED controller response, not a pending edit: fire_*() below
-  // only writes them after a successful send, never optimistically.
-  int ahu_mode = 0;        // 0 Off / 1 Ventilation / 2 Bypass / 3 Auto
-  int ahu_volume = 1;      // 0 off / 1 low / 2 mid / 3 high
-  bool ahu_clean = false;
-  int ahu_start_hour = 22; // 0..23 - local picker only, sent on "start"
-  int ahu_stop_hour = 6;   // 0..23 - local picker only, sent on "stop"
-  int eng_id = 1;        // 0..15
-  int vsp_supply = 1;    // 0 강 / 1 중 / 2 약
-  int vsp_exhaust = 1;
-  int filter_pct = 78;
-  int filter_hours = 1320;
-  bool wifi_connected = true;
-  int wifi_action = 0;   // 0 none / 1 pair / 2 scan / 3 disconnect
+  // Local picks for the RC controls - seeded from RcController state on
+  // entering the panel, sent only by fire_*() on OK.
+  int ahu_mode = 0;        // RC::UiMode: 0 환기 / 1 바이패스 / 2 청정 / 3 자동 / 4 AI
+  int ahu_volume = 1;      // 1 low / 2 mid / 3 high (stop = power key)
+  int resv_type = 0;       // 0 가동예약 / 1 정지예약 / 2 취침 / 3 취소 (old RC order)
+  int resv_min = 60;       // 10..1440, 10-minute steps
+  int eng_id = 1;        // device ID 1..99 (decimal = ID byte)
+  // VSP edit buffer, 0.05 V units, old RC order:
+  // 전열 배기 L/M/H, 전열 급기 L/M/H, 바이패스 배기 L/M/H, 바이패스 급기 L/M/H
+  int vsp[12] = {};
+  int vsp_slot = 0;      // 0..11 - Left/Right moves, Up/Down changes the value
+  int filter_init = RC_FILTER_INIT_DEFAULT_X100; // x100 h
+  int clock_y = 2026, clock_mo = 1, clock_d = 1, clock_h = 12, clock_mi = 0;
+  int lang = 0;         // ui_lang::Lang: 0 한국어 / 1 English
+  int pin = 0;          // 0000~9999, Engineer PIN edit
 };
+
+// Set when a new language was saved; main.cpp rebuilds the screens.
+bool s_langChanged = false;
 
 SettingsData s_data;
 SettingsData s_snap;
@@ -120,151 +207,51 @@ void apply_focus_frame(lv_obj_t *obj, bool focused) {
 void snapshot_data() { s_snap = s_data; }
 void restore_data() { s_data = s_snap; }
 
-// ---- AHU (RS-485 ventilation controller) live send/confirm plumbing ---
-//
-// Two distinct things, kept deliberately separate:
-//   s_data.ahu_mode/ahu_volume/ahu_clean - the LOCAL PICK. Up/Down
-//     selects a row, Left/Right edits this freely with nothing sent.
-//     Nothing here ever touches hardware by itself.
-//   s_confirmed* - what the real controller has actually acknowledged.
-//     Only ever updated inside fire_*() after a response that passed
-//     parity/header checks. This is what the confirmed-state badge
-//     shows, never the local pick above.
-// Mode/volume share one shadow byte in ahu_protocol, so one flag covers
-// both; Clean is a separate command header with no shared state, so it
-// gets its own flag. Both start false at boot - until the first real
-// confirmation, the badge says so plainly instead of guessing.
-int s_confirmedMode = 0;
-int s_confirmedVolume = 0;
-bool s_confirmedClean = false;
-bool s_ahuModeEverConfirmed = false;
-bool s_ahuCleanEverConfirmed = false;
-bool s_ahuSending = false;
+// ---- RC state (RcController) -------------------------------------------
+// s_data.ahu_* is the local pick edited with Left/Right. s_rc is the
+// controller's current state, pushed in through set_state(). OK only calls
+// a controller command: the change reaches MAIN in the next poll reply.
+RcDto s_rc;
+lv_obj_t *s_screen = nullptr;
 char s_ahuResultBuf[48] = "";
 const char *s_ahuResultMsg = nullptr;
 
-// Mirrors ahu_protocol.cpp's internal kMinCommandGapMs (not exposed from
-// there, and that file is settled/untouched here) so a press inside the
-// cooldown window can show "wait" instead of "failed - no response" -
-// those are different situations and the distinction was asked for.
-constexpr uint32_t kUiAhuGapMs = 1500;
-uint32_t s_lastAhuAttemptMs = 0;
 
-bool ahu_attempt_allowed() {
-  uint32_t now = millis();
-  return s_lastAhuAttemptMs == 0 || now - s_lastAhuAttemptMs >= kUiAhuGapMs;
-}
-
-void show_ahu_wait() {
-  snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s", "대기 - 너무 빠름 (Wait)");
+void show_result(bool ok) {
+  snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s",
+           ok ? tr("적용됨 - 다음 응답에 전송", "Queued - sent in the next reply")
+              : tr("무시됨 - LOCK/OFF/AUTO/취침", "Ignored - LOCK/OFF/AUTO/SLEEP"));
   s_ahuResultMsg = s_ahuResultBuf;
   refresh_content();
 }
 
-// Forces one real render+flush before the blocking RS-485 call, the same
-// way main.cpp's boot sequence pushes a real frame before turning the
-// backlight on - without this, "sending..." would never actually reach
-// the panel: this whole screen runs on one cooperative loop, so nothing
-// between setting a label and the blocking call below gets flushed.
-void begin_ahu_send() {
-  s_ahuSending = true;
-  s_ahuResultMsg = nullptr;
-  refresh_content();
-  lv_timer_handler();
-}
-
-void end_ahu_send(bool ok) {
-  s_ahuSending = false;
-  snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s", ok ? "전송 완료 (Sent)" : "실패 - 응답 없음 (Failed)");
-  s_ahuResultMsg = s_ahuResultBuf;
-  refresh_content();
-}
-
-// Display-only decode of the last D5/B5 mode byte. Bypass is shown first
-// if both bypass and auto bits are set.
-int decode_mode_from_shadow() {
-  uint8_t m = ahu_protocol::shadowMode();
-  if (m & 0x80) return 2; // Bypass
-  if (m & 0x08) return 3; // Auto
-  if (m & 0x10) return 1; // Ventilation
-  return 0;               // Off
-}
-
-// Sends whatever is CURRENTLY in s_data.ahu_mode (the local pick) - the
-// caller (handle_ok(), only while row 0 is focused) decides when that
-// happens, not this function.
+// Mode only - fan speed and power are untouched.
 void fire_mode() {
-  if (!ahu_attempt_allowed()) { show_ahu_wait(); return; }
-  s_lastAhuAttemptMs = millis();
-  begin_ahu_send();
-  bool ok;
-  switch (s_data.ahu_mode) {
-    case 0: ok = ahu_protocol::power_off(); break;
-    case 1: ok = ahu_protocol::set_ventilation(); break;
-    case 2: ok = ahu_protocol::set_bypass(); break;
-    default: ok = ahu_protocol::set_auto(); break;
-  }
-  if (ok) {
-    s_ahuModeEverConfirmed = true;
-    s_confirmedMode = decode_mode_from_shadow();
-    s_confirmedVolume = ahu_protocol::shadowMode() & 0x03;
-    s_snap.ahu_mode = s_data.ahu_mode; // lock in - a later Back must not undo a row already sent
-  }
-  end_ahu_send(ok);
+  static const char *names[RC::UI_MODE_COUNT] = {"ventilation", "bypass", "clean", "auto", "ai"};
+  bool ok = RcController::instance().setModeState(names[s_data.ahu_mode]);
+  s_snap.ahu_mode = s_data.ahu_mode;
+  show_result(ok);
 }
 
 void fire_volume() {
-  if (!ahu_attempt_allowed()) { show_ahu_wait(); return; }
-  s_lastAhuAttemptMs = millis();
-  begin_ahu_send();
-  bool ok = ahu_protocol::set_volume((uint8_t)s_data.ahu_volume);
-  if (ok) {
-    s_ahuModeEverConfirmed = true;
-    s_confirmedVolume = ahu_protocol::shadowMode() & 0x03;
-    s_confirmedMode = decode_mode_from_shadow();
-    s_snap.ahu_volume = s_data.ahu_volume;
-  }
-  end_ahu_send(ok);
+  bool ok = RcController::instance().setVolumeState(std::to_string(s_data.ahu_volume));
+  s_snap.ahu_volume = s_data.ahu_volume;
+  show_result(ok);
 }
 
-void fire_clean() {
-  if (!ahu_attempt_allowed()) { show_ahu_wait(); return; }
-  s_lastAhuAttemptMs = millis();
-  begin_ahu_send();
-  bool ok = ahu_protocol::set_clean(s_data.ahu_clean);
-  if (ok) {
-    s_ahuCleanEverConfirmed = true;
-    s_confirmedClean = s_data.ahu_clean;
-    s_snap.ahu_clean = s_data.ahu_clean;
+// Schedule panel send row: one-shot, leaves the panel afterwards.
+void fire_reservation() {
+  std::string cmd;
+  switch (s_data.resv_type) {
+    case 0: cmd = "start_reserve_" + std::to_string(s_data.resv_min); break;
+    case 1: cmd = "stop_reserve_" + std::to_string(s_data.resv_min); break;
+    case 2: cmd = "sleep"; break;
+    default: cmd = "cancel"; break;
   }
-  end_ahu_send(ok);
-}
-
-// One-shot actions (Schedule panel rows 2/3) - exit the panel once the
-// attempt resolves, success or failure, same as Filter's existing reset
-// button.
-void fire_start_reservation() {
-  if (!ahu_attempt_allowed()) { show_ahu_wait(); return; }
-  s_lastAhuAttemptMs = millis();
-  begin_ahu_send();
-  bool ok = ahu_protocol::start_reservation((uint8_t)s_data.ahu_start_hour, (uint8_t)s_data.ahu_stop_hour);
-  if (ok) s_ahuModeEverConfirmed = true;
-  end_ahu_send(ok);
+  bool ok = RcController::instance().setReservationState(cmd);
   s_in_panel = false;
   s_panel_row = 0;
-  refresh_content();
-}
-
-void fire_stop_reservation() {
-  if (!ahu_attempt_allowed()) { show_ahu_wait(); return; }
-  s_lastAhuAttemptMs = millis();
-  begin_ahu_send();
-  bool ok = ahu_protocol::stop_reservation((uint8_t)s_data.ahu_stop_hour);
-  if (ok) s_ahuModeEverConfirmed = true;
-  end_ahu_send(ok);
-  s_in_panel = false;
-  s_panel_row = 0;
-  refresh_content();
+  show_result(ok);
 }
 
 // Persistent footer bar. Labels are rebuilt by set_footer() whenever
@@ -307,6 +294,7 @@ lv_obj_t *make_card(lv_obj_t *parent, uint32_t bg) {
   lv_obj_set_style_radius(card, 14, 0);
   lv_obj_set_style_border_width(card, 1, 0);
   lv_obj_set_style_border_color(card, c(BORDER), 0);
+  elevate(card);
   return card;
 }
 
@@ -342,46 +330,7 @@ lv_obj_t *make_mode_option(lv_obj_t *parent, const char *main_text, const char *
   }
   make_label(top, main_text, &ui_font_sm, selected ? PILL_TEXT : TEXT_PRIMARY);
 
-  make_label(pill, sub_text, &ui_font_xs, selected ? PILL_TEXT_SUB : TEXT_DIM);
-  return pill;
-}
-
-// A single-line two-way toggle option (schedule screen's mode switches).
-// Always shows a bordered pill; selected fills it white. The unselected
-// dot can be a hollow ring or a plain filled bullet, per hollow_dot -
-// the mockup uses hollow for a real on/off choice and filled for a plain
-// category tab, so both are supported rather than picking one.
-lv_obj_t *make_toggle_pill(lv_obj_t *parent, const char *text, bool selected, bool hollow_dot) {
-  lv_obj_t *pill = make_card(parent, CARD_BG);
-  lv_obj_set_size(pill, LV_PCT(100), LV_PCT(100));
-  lv_obj_set_flex_grow(pill, 1);
-  lv_obj_set_style_radius(pill, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(pill, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-  lv_obj_set_style_bg_color(pill, c(PILL_BG), 0);
-  lv_obj_set_style_border_color(pill, c(selected ? PILL_BG : BORDER), 0);
-  if (selected) {
-    lv_obj_set_style_shadow_width(pill, 12, 0);
-    lv_obj_set_style_shadow_color(pill, c(PILL_BG), 0);
-    lv_obj_set_style_shadow_opa(pill, LV_OPA_40, 0);
-  }
-  lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(pill, 6, 0);
-
-  lv_obj_t *dot = lv_obj_create(pill);
-  lv_obj_remove_style_all(dot);
-  lv_obj_set_size(dot, 8, 8);
-  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  bool showHollow = hollow_dot && !selected;
-  lv_obj_set_style_bg_opa(dot, showHollow ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
-  if (showHollow) {
-    lv_obj_set_style_border_width(dot, 1, 0);
-    lv_obj_set_style_border_color(dot, c(TEXT_SECONDARY), 0);
-  } else {
-    lv_obj_set_style_bg_color(dot, c(selected ? PILL_TEXT : TEXT_PRIMARY), 0);
-  }
-
-  make_label(pill, text, &ui_font_sm, selected ? PILL_TEXT : TEXT_PRIMARY);
+  if (sub_text[0]) make_label(pill, sub_text, &ui_font_xs, selected ? PILL_TEXT_SUB : TEXT_DIM);
   return pill;
 }
 
@@ -419,7 +368,7 @@ lv_obj_t *make_level_option(lv_obj_t *parent, const char *main_text, const char 
   } else {
     make_label(pill, main_text, &ui_font_sm, TEXT_PRIMARY);
   }
-  make_label(pill, sub_text, &ui_font_xs, selected ? PILL_TEXT_SUB : TEXT_DIM);
+  if (sub_text[0]) make_label(pill, sub_text, &ui_font_xs, selected ? PILL_TEXT_SUB : TEXT_DIM);
   return slot;
 }
 
@@ -431,49 +380,45 @@ void build_ahu_status_strip(lv_obj_t *parent) {
   lv_obj_set_size(card, LV_PCT(100), 36);
   lv_obj_set_flex_grow(card, 0);
   lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  const char *text = s_ahuSending ? "전송 중... (Sending)" : (s_ahuResultMsg ? s_ahuResultMsg : "RS-485 대기 (Idle)");
-  make_label(card, text, &ui_font_xs, s_ahuSending ? ACCENT_CYAN : TEXT_DIM);
+  const char *text = s_rc.linkLost ? tr("통신 끊김", "No link to main unit")
+                                   : (s_ahuResultMsg ? s_ahuResultMsg : tr("PLC 대기", "PLC idle"));
+  make_label(card, text, &ui_font_xs, s_rc.linkLost ? ACCENT_CYAN : TEXT_DIM);
 }
 
-// Shows what the controller has actually acknowledged - separate from
-// the editable pick below, which never flips this on its own.
+// Current RC state (what the next reply to MAIN will carry), separate from
+// the editable pick below.
 void build_ahu_confirmed_badge(lv_obj_t *parent) {
-  static const char *modeShort[4] = {"Off", "Ventilation", "Bypass", "Auto"};
+  static const char *modeShort[RC::UI_MODE_COUNT] = {"Ventilation", "Bypass", "Clean", "Auto", "AI"};
   char buf[96];
-  if (s_ahuModeEverConfirmed && s_ahuCleanEverConfirmed) {
-    snprintf(buf, sizeof(buf), "확인됨 (Confirmed): %s / Vol %d / Clean %s", modeShort[s_confirmedMode],
-             s_confirmedVolume, s_confirmedClean ? "ON" : "OFF");
-  } else if (s_ahuModeEverConfirmed) {
-    snprintf(buf, sizeof(buf), "확인됨 (Confirmed): %s / Vol %d / Clean 미확인", modeShort[s_confirmedMode],
-             s_confirmedVolume);
-  } else {
-    snprintf(buf, sizeof(buf), "확인됨 (Confirmed): 아직 없음 (none yet - send a command first)");
-  }
+  snprintf(buf, sizeof(buf), "%s: %s / %s / Fan %d%s%s", tr("현재 상태", "State"),
+           s_rc.isRunning() ? "ON" : "OFF",
+           modeShort[s_rc.uiMode()], (int)s_rc.effectiveVolume(), s_rc.night ? " / SLEEP" : "",
+           s_rc.ahuLock ? " / LOCK" : "");
   lv_obj_t *l = make_label(parent, buf, &ui_font_xs, TEXT_DIM);
   lv_obj_set_flex_grow(l, 0);
 }
 
 // ---- Airflow section -> repurposed as live AHU control -----------------
 // Up/Down selects a row; Left/Right only edits the LOCAL pick
-// (s_data.ahu_mode/ahu_volume/ahu_clean) - nothing is sent yet. OK
+// (s_data.ahu_mode/ahu_volume) - nothing is sent yet. OK
 // (handle_ok()) sends the focused row's command and stays in the panel;
 // Back discards whatever was picked but never sent (see handle_back()).
 
 void build_airflow_panel(lv_obj_t *parent) {
   build_ahu_confirmed_badge(parent);
 
-  static const char *modeMain[4] = {"정지", "환기", "바이패스", "자동"};
-  static const char *modeSub[4] = {"(Off)", "(Ventilation)", "(Bypass)", "(Auto)"};
+  static const char *modeMain[RC::UI_MODE_COUNT] = {"환기", "바이패스", "청정", "자동", "AI"};
+  static const char *modeEn[RC::UI_MODE_COUNT] = {"Vent", "Bypass", "Clean", "Auto", "AI"};
 
   lv_obj_t *mode_row = make_row(parent, LV_PCT(100), 72, 8);
   lv_obj_set_flex_grow(mode_row, 0);
   apply_focus_frame(mode_row, s_panel_row == 0);
-  for (int i = 0; i < 4; i++) {
-    make_mode_option(mode_row, modeMain[i], modeSub[i], i == s_data.ahu_mode);
+  for (int i = 0; i < RC::UI_MODE_COUNT; i++) {
+    make_mode_option(mode_row, tr(modeMain[i], modeEn[i]), "", i == s_data.ahu_mode);
   }
 
-  static const char *volMain[4] = {"꺼짐", "약", "중", "강"};
-  static const char *volSub[4] = {"(Off)", "(Low)", "(Mid)", "(High)"};
+  static const char *volMain[3] = {"약", "중", "강"};
+  static const char *volEn[3] = {"Low", "Mid", "High"};
   lv_obj_t *vol_row = make_card(parent, CARD_BG);
   lv_obj_set_size(vol_row, LV_PCT(100), 72);
   lv_obj_set_flex_grow(vol_row, 0);
@@ -484,67 +429,107 @@ void build_airflow_panel(lv_obj_t *parent) {
   lv_obj_t *vol_label = make_plain(vol_row);
   lv_obj_set_size(vol_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(vol_label, LV_FLEX_FLOW_COLUMN);
-  make_label(vol_label, "풍량", &ui_font_sm, TEXT_PRIMARY);
-  make_label(vol_label, "(Fan Volume)", &ui_font_xs, TEXT_SECONDARY);
+  make_label(vol_label, tr("풍량", "Fan"), &ui_font_sm, TEXT_PRIMARY);
+  if (ui_lang::en()) make_label(vol_label, "Volume", &ui_font_xs, TEXT_SECONDARY);
   lv_obj_t *vol_options = make_row(vol_row, LV_PCT(100), LV_PCT(100), 4);
   lv_obj_set_flex_grow(vol_options, 1);
-  for (int i = 0; i < 4; i++) {
-    make_level_option(vol_options, volMain[i], volSub[i], i == s_data.ahu_volume);
+  for (int i = 0; i < 3; i++) {
+    make_level_option(vol_options, tr(volMain[i], volEn[i]), "", i + 1 == s_data.ahu_volume);
   }
-
-  lv_obj_t *clean_row = make_row(parent, LV_PCT(100), 56, 8);
-  lv_obj_set_flex_grow(clean_row, 0);
-  apply_focus_frame(clean_row, s_panel_row == 2);
-  bool cleanOn = s_data.ahu_clean;
-  make_toggle_pill(clean_row, "청정 꺼짐 (Off)", !cleanOn, true);
-  make_toggle_pill(clean_row, "청정 가동 (Clean)", cleanOn, true);
 
   build_ahu_status_strip(parent);
 }
 
-// ---- Schedule section -> repurposed as AHU absolute-hour reservation --
-// Rows 0/1 are plain local pickers (Left/Right adjusts, nothing sent).
-// Rows 2/3 are one-shot actions: OK fires start_reservation()/
-// stop_reservation() respectively (handle_ok() branches on s_panel_row
-// for this section) and then exits the panel, success or failure.
+// ---- Schedule section - old RC reservation (SHR-L2 2.3) ---------------
+// Row 0: type pills, Left/Right cycles 가동예약 -> 정지예약 -> 취침 -> 취소.
+// Row 1: time stepper in 10-minute steps (start / stop reservation only).
+// OK on either row sends (fire_reservation()) and leaves the panel.
 
-void build_hour_stepper(lv_obj_t *parent, const char *label_main, const char *label_sub, int hour, bool focused) {
-  lv_obj_t *card = make_card(parent, CARD_BG);
-  lv_obj_set_size(card, LV_PCT(100), 72);
-  lv_obj_set_flex_grow(card, 0);
-  lv_obj_set_style_pad_hor(card, 16, 0);
-  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  apply_focus_frame(card, focused);
-
-  lv_obj_t *label = make_plain(card);
-  lv_obj_set_flex_flow(label, LV_FLEX_FLOW_COLUMN);
-  make_label(label, label_main, &ui_font_sm, TEXT_PRIMARY);
-  make_label(label, label_sub, &ui_font_xs, TEXT_SECONDARY);
-
-  lv_obj_t *value_row = make_row(card, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 10);
-  make_label(value_row, LV_SYMBOL_LEFT, &lv_font_montserrat_14, TEXT_DIM);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%02d:00", hour);
-  make_label(value_row, buf, &ui_font_xxl, TEXT_PRIMARY);
-  make_label(value_row, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, TEXT_DIM);
+// Round "-" / "+" key of the time stepper.
+void make_step_key(lv_obj_t *parent, const char *glyph, bool active) {
+  lv_obj_t *key = make_plain(parent);
+  lv_obj_set_size(key, 52, 52);
+  lv_obj_set_style_radius(key, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(key, c(CARD_BG_ALT), 0);
+  lv_obj_set_style_bg_opa(key, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(key, 1, 0);
+  lv_obj_set_style_border_color(key, c(active ? TEXT_SECONDARY : BORDER), 0);
+  lv_obj_t *l = make_label(key, glyph, &ui_font_md, active ? TEXT_PRIMARY : TEXT_DIM);
+  lv_obj_center(l);
 }
 
-void build_reservation_action(lv_obj_t *parent, const char *text, bool focused) {
-  lv_obj_t *btn = make_card(parent, CARD_BG_ALT);
-  lv_obj_set_size(btn, LV_PCT(100), 52);
-  lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_flex_grow(btn, 0);
-  lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  apply_focus_frame(btn, focused);
-  make_label(btn, text, &ui_font_sm, TEXT_PRIMARY);
+// "PM 06:22 자동 정지 예약 / Auto Off at 18:22" - when the reservation will
+// act, from the current RTC time; falls back to "in H:MM" without a clock.
+void reservation_info(char *buf, size_t n) {
+  const int type = s_data.resv_type;
+  if (type == 2) {
+    snprintf(buf, n, "%s", tr("취침 모드 - 약풍", "Sleep mode - Low fan"));
+    return;
+  }
+  if (type == 3) {
+    snprintf(buf, n, "%s", tr("예약 취소", "Cancel reservation"));
+    return;
+  }
+  const char *ko = type == 0 ? "자동 가동 예약" : "자동 정지 예약";
+  const char *en = type == 0 ? "Auto On" : "Auto Off";
+  if (!s_clockValid) {
+    if (ui_lang::en()) snprintf(buf, n, "%s in %d:%02d", en, s_data.resv_min / 60, s_data.resv_min % 60);
+    else snprintf(buf, n, "%s %d:%02d 후", ko, s_data.resv_min / 60, s_data.resv_min % 60);
+    return;
+  }
+  const int at = (s_clockH * 60 + s_clockM + s_data.resv_min) % (24 * 60);
+  const int h24 = at / 60, m = at % 60;
+  const int h12 = h24 % 12 == 0 ? 12 : h24 % 12;
+  if (ui_lang::en()) snprintf(buf, n, "%s at %s %02d:%02d", en, h24 < 12 ? "AM" : "PM", h12, m);
+  else snprintf(buf, n, "%s %s %02d:%02d", ko, h24 < 12 ? "AM" : "PM", h12, m);
 }
 
 void build_schedule_panel(lv_obj_t *parent) {
-  build_hour_stepper(parent, "예약 시작", "(Start Hour)", s_data.ahu_start_hour, s_panel_row == 0);
-  build_hour_stepper(parent, "예약 종료", "(Stop Hour)", s_data.ahu_stop_hour, s_panel_row == 1);
-  build_reservation_action(parent, "예약 시작 전송 (Send Start Reservation)", s_panel_row == 2);
-  build_reservation_action(parent, "예약 해제 전송 (Send Stop Reservation)", s_panel_row == 3);
+  static const char *typeMain[4] = {"가동 예약", "정지 예약", "취침", "취소"};
+  static const char *typeEn[4] = {"Start", "Stop", "Sleep", "Cancel"};
+  const bool timed = s_data.resv_type <= 1;
+
+  lv_obj_t *type_row = make_row(parent, LV_PCT(100), 64, 8);
+  lv_obj_set_flex_grow(type_row, 0);
+  apply_focus_frame(type_row, s_panel_row == 0);
+  for (int i = 0; i < 4; i++) {
+    make_mode_option(type_row, tr(typeMain[i], typeEn[i]), "", i == s_data.resv_type);
+  }
+
+  // Time stepper card: [-]  1:30 후  [+], with the "acts at" line below.
+  lv_obj_t *card = make_card(parent, CARD_BG);
+  lv_obj_set_size(card, LV_PCT(100), 150);
+  lv_obj_set_flex_grow(card, 0);
+  lv_obj_set_style_pad_all(card, 12, 0);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(card, 10, 0);
+  apply_focus_frame(card, s_panel_row == 1);
+
+  lv_obj_t *stepper = make_row(card, LV_PCT(100), 80, 0);
+  lv_obj_set_flex_align(stepper, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_hor(stepper, 24, 0);
+  make_step_key(stepper, "-", timed);
+
+  lv_obj_t *value = make_row(stepper, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 10);
+  lv_obj_set_flex_align(value, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+  char time_buf[16];
+  if (timed) snprintf(time_buf, sizeof(time_buf), "%d:%02d", s_data.resv_min / 60, s_data.resv_min % 60);
+  else snprintf(time_buf, sizeof(time_buf), "--:--");
+  make_label(value, time_buf, &ui_font_xxl, timed ? TEXT_PRIMARY : TEXT_DIM);
+  make_label(value, tr("후", "later"), &ui_font_md, timed ? TEXT_SECONDARY : TEXT_DIM);
+
+  make_step_key(stepper, "+", timed);
+
+  lv_obj_t *info = make_card(card, CARD_BG_ALT);
+  lv_obj_set_size(info, LV_PCT(100), 34);
+  lv_obj_set_style_radius(info, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_flex_flow(info, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(info, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  char info_buf[80];
+  reservation_info(info_buf, sizeof(info_buf));
+  make_label(info, info_buf, &ui_font_xs, TEXT_SECONDARY);
+
   build_ahu_status_strip(parent);
 }
 
@@ -564,7 +549,25 @@ lv_obj_t *make_status_chip(lv_obj_t *parent, const char *text, uint32_t color) {
   return chip;
 }
 
+// Filter values: MAIN's D6 when it sends one, otherwise the RC's own
+// running-time count (RC_FILTER_LOCAL_COUNT). OK sends the initial value
+// (B5 Data2 = 5), which also resets the filter time to it.
 void build_filter_panel(lv_obj_t *parent) {
+  const bool have = s_rc.hasFilterInfo();
+  const int init = s_in_panel ? s_data.filter_init : s_rc.filterInit;
+  const int remainH = s_rc.filterRemainHours();
+  const int pct = have ? s_rc.filterRemainPct() : 0;
+  const char *chipText = tr("정상", "Normal");
+  uint32_t chipColor = ACCENT_CYAN;
+  if (s_rc.filterReplaceDue()) {
+    chipText = tr("교체", "Replace");
+    chipColor = DANGER;
+  } else if (s_rc.errCode & PLC::FILTER_CLEAN_ALARM) {
+    chipText = tr("청소", "Clean");
+    chipColor = WARN;
+  }
+  const char *hours = tr("시간", "h");
+
   lv_obj_t *top_row = make_row(parent, LV_PCT(100), 190, 20);
   lv_obj_set_flex_grow(top_row, 0);
 
@@ -579,7 +582,7 @@ void build_filter_panel(lv_obj_t *parent) {
   lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
   lv_arc_set_bg_angles(ring, 0, 360);
   lv_arc_set_range(ring, 0, 100);
-  lv_arc_set_value(ring, s_data.filter_pct);
+  lv_arc_set_value(ring, pct);
   lv_obj_remove_style(ring, NULL, LV_PART_KNOB);
   lv_obj_set_style_arc_width(ring, 14, LV_PART_MAIN);
   lv_obj_set_style_arc_color(ring, c(TRACK), LV_PART_MAIN);
@@ -589,10 +592,11 @@ void build_filter_panel(lv_obj_t *parent) {
   lv_obj_set_style_arc_rounded(ring, true, LV_PART_INDICATOR);
 
   char pct_buf[8];
-  snprintf(pct_buf, sizeof(pct_buf), "%d%%", s_data.filter_pct);
-  lv_obj_t *pct = make_label(gauge, pct_buf, &ui_font_xxl, TEXT_PRIMARY);
-  lv_obj_align(pct, LV_ALIGN_CENTER, 0, -16);
-  lv_obj_t *chip = make_status_chip(gauge, "정상", ACCENT_CYAN);
+  if (have) snprintf(pct_buf, sizeof(pct_buf), "%d%%", pct);
+  else snprintf(pct_buf, sizeof(pct_buf), "--%%");
+  lv_obj_t *pct_label = make_label(gauge, pct_buf, &ui_font_xxl, TEXT_PRIMARY);
+  lv_obj_align(pct_label, LV_ALIGN_CENTER, 0, -16);
+  lv_obj_t *chip = make_status_chip(gauge, chipText, chipColor);
   lv_obj_align(chip, LV_ALIGN_CENTER, 0, 24);
 
   // Usage stats, to the right of the ring.
@@ -605,19 +609,28 @@ void build_filter_panel(lv_obj_t *parent) {
 
   lv_obj_t *usage = make_plain(info);
   lv_obj_set_flex_flow(usage, LV_FLEX_FLOW_COLUMN);
-  make_label(usage, "누적 사용:", &ui_font_sm, TEXT_SECONDARY);
+  make_label(usage, tr("누적 사용:", "Used:"), &ui_font_sm, TEXT_SECONDARY);
   char hours_buf[20];
-  snprintf(hours_buf, sizeof(hours_buf), "%d 시간", s_data.filter_hours);
+  if (have) {
+    snprintf(hours_buf, sizeof(hours_buf), "%d %s", s_rc.filterUsedHours(), hours);
+  } else {
+    snprintf(hours_buf, sizeof(hours_buf), "-- %s", hours);
+  }
   make_label(usage, hours_buf, &ui_font_md, TEXT_PRIMARY);
 
   lv_obj_t *replace = make_plain(info);
   lv_obj_set_flex_flow(replace, LV_FLEX_FLOW_COLUMN);
-  make_label(replace, "교체 권장일:", &ui_font_sm, TEXT_SECONDARY);
+  make_label(replace, tr("잔여 시간:", "Remaining:"), &ui_font_sm, TEXT_SECONDARY);
   lv_obj_t *dateRow = make_row(replace, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
-  make_label(dateRow, "2027.03.15", &ui_font_md, TEXT_PRIMARY);
-  make_label(dateRow, "(권장)", &ui_font_xs, TEXT_DIM);
+  char remain_buf[20];
+  if (have) snprintf(remain_buf, sizeof(remain_buf), "%d %s", remainH, hours);
+  else snprintf(remain_buf, sizeof(remain_buf), "-- %s", hours);
+  make_label(dateRow, remain_buf, &ui_font_md, TEXT_PRIMARY);
 
-  lv_obj_t *note = make_label(parent, "* 실내외 공기질 및 사용 환경에 따라\n차이가 있을 수 있습니다.", &ui_font_xs, TEXT_DIM);
+  lv_obj_t *note = make_label(parent,
+                              tr("* 실내외 공기질 및 사용 환경에 따라\n차이가 있을 수 있습니다.",
+                                 "* May vary with indoor/outdoor air quality\nand usage."),
+                              &ui_font_xs, TEXT_DIM);
   lv_obj_set_size(note, LV_PCT(100), LV_SIZE_CONTENT);
   lv_obj_set_flex_grow(note, 0);
 
@@ -628,7 +641,10 @@ void build_filter_panel(lv_obj_t *parent) {
   apply_focus_frame(reset_btn, true);
   lv_obj_t *reset_row = make_row(reset_btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 8);
   ui_icons::refresh(reset_row, 20, c(TEXT_PRIMARY));
-  make_label(reset_row, "필터 초기화 (RESET)", &ui_font_sm, TEXT_PRIMARY);
+  char reset_buf[48];
+  if (ui_lang::en()) snprintf(reset_buf, sizeof(reset_buf), "Filter RESET - initial %d h", init * 100);
+  else snprintf(reset_buf, sizeof(reset_buf), "필터 초기화 - 초기값 %d 시간", init * 100);
+  make_label(reset_row, reset_buf, &ui_font_sm, TEXT_PRIMARY);
 }
 
 // ---- Wi-Fi section (per the reference mockup) --------------------------
@@ -648,52 +664,511 @@ lv_obj_t *make_action_button(lv_obj_t *parent, lv_obj_t *(*icon_fn)(lv_obj_t *, 
   lv_obj_t *text = make_plain(btn);
   lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
   make_label(text, main_text, &ui_font_sm, TEXT_PRIMARY);
-  make_label(text, sub_text, &ui_font_xs, TEXT_SECONDARY);
+  if (sub_text[0]) make_label(text, sub_text, &ui_font_xs, TEXT_SECONDARY);
   return btn;
 }
 
-void build_wifi_panel(lv_obj_t *parent) {
+// Signal-strength icon: the first `bars` of 4 lit, the rest dim.
+void make_signal(lv_obj_t *parent, lv_coord_t size, int bars, uint32_t color) {
+  lv_obj_t *icon = ui_icons::wifi_bars(parent, size, c(color));
+  for (int i = bars; i < 4; i++) {
+    lv_obj_t *bar = lv_obj_get_child(icon, i);
+    if (bar) lv_obj_set_style_bg_color(bar, c(TRACK), 0);
+  }
+}
+
+// A label that wraps inside its parent's width.
+lv_obj_t *make_wrap_label(lv_obj_t *parent, const char *text, const lv_font_t *font, uint32_t color) {
+  lv_obj_t *l = make_label(parent, text, font, color);
+  lv_obj_set_width(l, LV_PCT(100));
+  lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+  return l;
+}
+
+// "'SSID' 연결 실패 - 비밀번호를 확인하세요" for the last failed new network.
+void wifi_fail_text(char *buf, size_t n) {
+  const char *ssid = s_wifi.failSsid;
+  switch (s_wifi.fail) {
+    case WIFI::FAIL_AUTH:
+      snprintf(buf, n, tr("'%s' 연결 실패 - 비밀번호를 확인하세요", "'%s' failed - check the password"), ssid);
+      break;
+    case WIFI::FAIL_NO_AP:
+      snprintf(buf, n, tr("'%s' 연결 실패 - 네트워크를 찾을 수 없음", "'%s' failed - network not found"), ssid);
+      break;
+    default:
+      snprintf(buf, n, tr("'%s' 연결 실패", "'%s' failed to connect"), ssid);
+      break;
+  }
+}
+
+// Main view: live status + the three actions (QR setup, scan, forget).
+void build_wifi_main(lv_obj_t *parent) {
+  const bool connected = s_wifi.connected();
   lv_obj_t *card = make_card(parent, CARD_BG);
-  lv_obj_set_size(card, LV_PCT(100), 150);
+  lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
   lv_obj_set_flex_grow(card, 0);
-  lv_obj_set_style_pad_all(card, 16, 0);
+  lv_obj_set_style_pad_all(card, 14, 0);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(card, 8, 0);
+  lv_obj_set_style_pad_row(card, 6, 0);
 
   lv_obj_t *ssid_row = make_row(card, LV_PCT(100), LV_SIZE_CONTENT, 8);
   lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  make_label(ssid_row, s_data.wifi_connected ? "CENDORI_AI_Air_2.4G" : "네트워크 없음", &ui_font_md, TEXT_PRIMARY);
-  ui_icons::wifi_bars(ssid_row, 22, c(s_data.wifi_connected ? ACCENT_CYAN : TEXT_DIM));
+  const bool named = s_wifi.ssid[0] && s_wifi.state != WIFI::OFF;
+  make_label(ssid_row, named ? s_wifi.ssid : tr("네트워크 없음", "No network"), &ui_font_md, TEXT_PRIMARY);
+  make_signal(ssid_row, 22, connected ? WIFI::bars(s_wifi.rssi) : 0, ACCENT_CYAN);
 
-  if (s_data.wifi_connected) {
-    make_status_chip(card, "정상 연결됨 (Connected)", ACCENT_CYAN);
-  } else {
-    make_status_chip(card, "연결 끊김 (Disconnected)", TEXT_DIM);
+  switch (s_wifi.state) {
+    case WIFI::CONNECTED:
+      make_status_chip(card, tr("연결됨", "Connected"), ACCENT_CYAN);
+      break;
+    case WIFI::CONNECTING:
+      make_status_chip(card, tr("연결 중...", "Connecting..."), WARN);
+      break;
+    case WIFI::FAILED:
+      make_status_chip(card, tr("연결 실패", "Failed"), DANGER);
+      break;
+    default:
+      make_status_chip(card, tr("미연결", "Not connected"), TEXT_DIM);
+      break;
+  }
+  if (s_wifi.fail != WIFI::FAIL_NONE && s_wifi.failSsid[0]) {
+    char fail[96];
+    wifi_fail_text(fail, sizeof(fail));
+    make_wrap_label(card, fail, &ui_font_xs, DANGER);
   }
 
   lv_obj_t *ip_row = make_row(card, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
   make_label(ip_row, "IP:", &ui_font_sm, TEXT_SECONDARY);
-  make_label(ip_row, s_data.wifi_connected ? "192.168.1.105" : "-", &ui_font_sm, TEXT_PRIMARY);
-
+  make_label(ip_row, s_wifi.ip[0] ? s_wifi.ip : "-", &ui_font_sm, TEXT_PRIMARY);
   lv_obj_t *mac_row = make_row(card, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
   make_label(mac_row, "MAC:", &ui_font_sm, TEXT_SECONDARY);
-  make_label(mac_row, "AC:67:B2:44:8A:1C", &ui_font_sm, TEXT_PRIMARY);
+  make_label(mac_row, s_wifi.mac[0] ? s_wifi.mac : "-", &ui_font_sm, TEXT_PRIMARY);
 
-  lv_obj_t *actions_row = make_row(parent, LV_PCT(100), 80, 8);
+  lv_obj_t *actions_row = make_row(parent, LV_PCT(100), 72, 8);
   lv_obj_set_flex_grow(actions_row, 0);
-  lv_obj_t *pair_btn = make_action_button(actions_row, ui_icons::phone, "스마트폰 간편 연결", "(App / QR Pairing)");
-  lv_obj_t *scan_btn = make_action_button(actions_row, ui_icons::search, "주변 Wi-Fi 검색", "(Scan AP List)");
+  lv_obj_t *pair_btn = make_action_button(actions_row, ui_icons::phone, tr("스마트폰 간편 연결", "Phone / QR Setup"),
+                                          "");
+  lv_obj_t *scan_btn = make_action_button(actions_row, ui_icons::search, tr("주변 Wi-Fi 검색", "Scan Wi-Fi"),
+                                          "");
   apply_focus_frame(pair_btn, s_panel_row == 0);
   apply_focus_frame(scan_btn, s_panel_row == 1);
 
   lv_obj_t *disconnect_btn = make_card(parent, CARD_BG_ALT);
-  lv_obj_set_size(disconnect_btn, LV_PCT(100), 48);
+  lv_obj_set_size(disconnect_btn, LV_PCT(100), 44);
+  lv_obj_set_flex_grow(disconnect_btn, 0);
   lv_obj_set_style_radius(disconnect_btn, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_flex_align(disconnect_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   apply_focus_frame(disconnect_btn, s_panel_row == 2);
   lv_obj_t *dc_row = make_row(disconnect_btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 8);
   ui_icons::disconnect(dc_row, 18, c(TEXT_PRIMARY));
-  make_label(dc_row, "네트워크 초기화 (Disconnect)", &ui_font_sm, TEXT_PRIMARY);
+  make_label(dc_row, tr("네트워크 초기화", "Disconnect & forget"), &ui_font_sm, TEXT_PRIMARY);
+}
+
+// QR view: the phone scans the code, joins the setup AP and gets the
+// portal page (WifiPortal) to pick the home network and type the password.
+void build_wifi_qr(lv_obj_t *parent) {
+  lv_obj_t *row = make_row(parent, LV_PCT(100), LV_PCT(100), 14);
+  lv_obj_set_flex_grow(row, 1);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  // White quiet zone around the code so phone cameras lock on easily.
+  lv_obj_t *qr_box = make_plain(row);
+  lv_obj_set_size(qr_box, 196, 196);
+  lv_obj_set_style_bg_color(qr_box, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(qr_box, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(qr_box, 12, 0);
+  char qr_text[96];
+  snprintf(qr_text, sizeof(qr_text), "WIFI:T:WPA;S:%s;P:%s;;", s_wifi.apSsid, s_wifi.apPass);
+  lv_obj_t *qr = lv_qrcode_create(qr_box, 172, lv_color_black(), lv_color_white());
+  lv_qrcode_update(qr, qr_text, strlen(qr_text));
+  lv_obj_center(qr);
+
+  lv_obj_t *info = make_plain(row);
+  lv_obj_set_size(info, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_grow(info, 1);
+  lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(info, 8, 0);
+
+  make_wrap_label(info, tr("스마트폰으로 연결", "Connect with your phone"), &ui_font_md, TEXT_PRIMARY);
+  make_wrap_label(info, tr("1. 휴대폰 카메라로 QR 코드를 스캔하세요", "1. Scan the QR code with the phone camera"),
+                  &ui_font_xs, TEXT_SECONDARY);
+  make_wrap_label(info,
+                  tr("2. 열린 페이지에서 Wi-Fi 를 선택하고 비밀번호를 입력하세요",
+                     "2. On the page that opens, pick your Wi-Fi and enter the password"),
+                  &ui_font_xs, TEXT_SECONDARY);
+  make_wrap_label(info, tr("페이지가 안 열리면 브라우저에서 " WIFI_AP_IP " 접속",
+                           "If no page opens, browse to " WIFI_AP_IP),
+                  &ui_font_xs, TEXT_DIM);
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s %s", tr("네트워크:", "Network:"), s_wifi.apSsid);
+  make_label(info, buf, &ui_font_sm, TEXT_PRIMARY);
+  snprintf(buf, sizeof(buf), "%s %s", tr("비밀번호:", "Password:"), s_wifi.apPass);
+  make_label(info, buf, &ui_font_sm, TEXT_PRIMARY);
+
+  char status[96];
+  uint32_t color = TEXT_DIM;
+  if (s_wifi.state == WIFI::CONNECTED && s_wifi.setup) {
+    snprintf(status, sizeof(status), "%s %s", tr("연결됨:", "Connected:"), s_wifi.ssid);
+    color = ACCENT_CYAN;
+  } else if (s_wifi.state == WIFI::CONNECTING && s_wifi.ssid[0]) {
+    snprintf(status, sizeof(status), "%s %s", tr("연결 중:", "Connecting:"), s_wifi.ssid);
+    color = WARN;
+  } else if (s_wifi.fail != WIFI::FAIL_NONE && s_wifi.failSsid[0]) {
+    wifi_fail_text(status, sizeof(status));
+    color = DANGER;
+  } else if (!s_wifi.setup) {
+    snprintf(status, sizeof(status), "%s", tr("준비 중...", "Starting..."));
+  } else if (s_wifi.apClients > 0) {
+    snprintf(status, sizeof(status), "%s", tr("휴대폰 연결됨", "Phone connected"));
+    color = ACCENT_CYAN;
+  } else {
+    snprintf(status, sizeof(status), "%s", tr("휴대폰 연결 대기 중", "Waiting for the phone"));
+  }
+  make_wrap_label(info, status, &ui_font_sm, color);
+}
+
+// Scan view: nearby networks (strongest first) + a "rescan" row at the end.
+constexpr int kScanVisible = 6;
+
+void build_wifi_scan(lv_obj_t *parent) {
+  const int n = s_wifi.apCount;
+  if (s_wifiSel > n) s_wifiSel = n;
+
+  lv_obj_t *head = make_row(parent, LV_PCT(100), LV_SIZE_CONTENT, 8);
+  lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  make_label(head, tr("주변 Wi-Fi", "Nearby networks"), &ui_font_sm, TEXT_SECONDARY);
+  if (s_wifi.scanning) make_label(head, tr("검색 중...", "Scanning..."), &ui_font_xs, WARN);
+
+  if (n == 0) {
+    lv_obj_t *empty = make_card(parent, CARD_BG);
+    lv_obj_set_size(empty, LV_PCT(100), 80);
+    lv_obj_set_flex_grow(empty, 0);
+    lv_obj_set_flex_align(empty, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    make_label(empty,
+               s_wifi.scanning ? tr("검색 중...", "Scanning...")
+                               : tr("네트워크를 찾지 못했습니다", "No networks found"),
+               &ui_font_sm, TEXT_DIM);
+  }
+
+  // Window of kScanVisible rows that keeps the selection visible.
+  const int total = n + 1;
+  int first = s_wifiSel - (kScanVisible - 1);
+  if (first < 0) first = 0;
+  const int last = first + kScanVisible < total ? first + kScanVisible : total;
+  for (int i = first; i < last; i++) {
+    lv_obj_t *item = make_card(parent, CARD_BG);
+    lv_obj_set_size(item, LV_PCT(100), 40);
+    lv_obj_set_flex_grow(item, 0);
+    lv_obj_set_style_pad_hor(item, 12, 0);
+    lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(item, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(item, 10, 0);
+    apply_focus_frame(item, i == s_wifiSel);
+    if (i < n) {
+      const WIFI::ApInfo &ap = s_wifi.aps[i];
+      make_signal(item, 18, WIFI::bars(ap.rssi), ACCENT_CYAN);
+      lv_obj_t *name = make_label(item, ap.ssid, &ui_font_sm, TEXT_PRIMARY);
+      lv_obj_set_flex_grow(name, 1);
+      lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+      if (s_wifi.connected() && strcmp(ap.ssid, s_wifi.ssid) == 0) {
+        make_label(item, tr("연결됨", "Connected"), &ui_font_xs, ACCENT_CYAN);
+      }
+      if (ap.secure) ui_icons::lock(item, 14, c(TEXT_SECONDARY));
+    } else {
+      ui_icons::refresh(item, 18, c(TEXT_SECONDARY));
+      make_label(item, tr("다시 검색", "Rescan"), &ui_font_sm, TEXT_SECONDARY);
+    }
+  }
+}
+
+// Keyboard view: password entry with the arrow keys. Rows 0-3 are the
+// character grid of the current page, row 4 the special keys.
+const char *const kKbPages[3][4] = {
+    {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm-_."},
+    {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM-_."},
+    {"!@#$%^&*()", "`~-_=+[]{}", "\\|;:'\",<>", "./?"},
+};
+constexpr int kKbRows = 5;
+constexpr int kKbSpecial = 4; // page / space / delete / connect
+constexpr size_t kKbMaxLen = 63;
+
+int kb_row_len(int row) { return row < 4 ? (int)strlen(kKbPages[s_kbPage][row]) : kKbSpecial; }
+
+lv_obj_t *make_key(lv_obj_t *parent, const char *text, const lv_font_t *font, bool selected, lv_coord_t w,
+                   uint32_t text_color) {
+  lv_obj_t *key = make_card(parent, CARD_BG);
+  lv_obj_set_size(key, w, 34);
+  lv_obj_set_style_radius(key, 8, 0);
+  lv_obj_set_flex_align(key, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  if (selected) {
+    lv_obj_set_style_bg_color(key, c(PILL_BG), 0);
+    lv_obj_set_style_shadow_width(key, 12, 0);
+    lv_obj_set_style_shadow_color(key, c(PILL_BG), 0);
+    lv_obj_set_style_shadow_opa(key, LV_OPA_40, 0);
+  }
+  make_label(key, text, font, selected ? PILL_TEXT : text_color);
+  return key;
+}
+
+void build_wifi_keyboard(lv_obj_t *parent) {
+  char title[64];
+  snprintf(title, sizeof(title), "'%s' %s", s_kbSsid, tr("비밀번호", "password"));
+  lv_obj_t *t = make_label(parent, title, &ui_font_sm, TEXT_SECONDARY);
+  lv_obj_set_width(t, LV_PCT(100));
+  lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+
+  lv_obj_t *field = make_card(parent, CARD_BG_ALT);
+  lv_obj_set_size(field, LV_PCT(100), 40);
+  lv_obj_set_flex_grow(field, 0);
+  lv_obj_set_style_pad_hor(field, 12, 0);
+  lv_obj_set_flex_flow(field, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(field, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  std::string shown = s_kbText + "_";
+  lv_obj_t *text = make_label(field, shown.c_str(), &ui_font_md, TEXT_PRIMARY);
+  lv_obj_set_flex_grow(text, 1);
+  lv_label_set_long_mode(text, LV_LABEL_LONG_CLIP);
+  if (!s_kbText.empty() && s_kbText.size() < 8) {
+    make_label(field, tr("8자 이상", "min 8 chars"), &ui_font_xs, WARN);
+  }
+
+  lv_obj_t *grid = make_plain(parent);
+  lv_obj_set_size(grid, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(grid, 5, 0);
+  for (int r = 0; r < 4; r++) {
+    lv_obj_t *row = make_row(grid, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 5);
+    const char *chars = kKbPages[s_kbPage][r];
+    for (int i = 0; chars[i]; i++) {
+      char ch[2] = {chars[i], 0};
+      make_key(row, ch, &ui_font_sm, r == s_kbRow && i == s_kbCol, 44, TEXT_PRIMARY);
+    }
+  }
+  static const char *kNextPage[3] = {"ABC", "#+=", "abc"};
+  lv_obj_t *special = make_row(grid, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 5);
+  const bool onSpecial = s_kbRow == 4;
+  make_key(special, kNextPage[s_kbPage], &ui_font_sm, onSpecial && s_kbCol == 0, 80, TEXT_SECONDARY);
+  make_key(special, tr("공백", "Space"), &ui_font_sm, onSpecial && s_kbCol == 1, 140, TEXT_SECONDARY);
+  make_key(special, LV_SYMBOL_BACKSPACE, &lv_font_montserrat_20, onSpecial && s_kbCol == 2, 80, TEXT_SECONDARY);
+  make_key(special, tr("연결", "Connect"), &ui_font_sm, onSpecial && s_kbCol == 3, 140, ACCENT_CYAN);
+}
+
+void build_wifi_panel(lv_obj_t *parent) {
+  switch (s_in_panel ? s_wifiView : WifiView::Main) {
+    case WifiView::Qr:
+      build_wifi_qr(parent);
+      break;
+    case WifiView::Scan:
+      build_wifi_scan(parent);
+      break;
+    case WifiView::Keyboard:
+      build_wifi_keyboard(parent);
+      break;
+    default:
+      build_wifi_main(parent);
+      break;
+  }
+}
+
+// ---- Wi-Fi panel keys ----------------------------------------------------
+
+enum class Key { Up, Down, Left, Right, Ok, Back };
+
+bool wifi_panel_active() { return s_in_panel && s_mode == Mode::Outer && s_selected == 2; }
+
+void wifi_main_ok() {
+  WifiController &wifi = WifiController::instance();
+  if (s_panel_row == 0) {
+    wifi.startSetup();
+    s_wifiView = WifiView::Qr;
+  } else if (s_panel_row == 1) {
+    wifi.startScan();
+    s_wifiSel = 0;
+    s_wifiView = WifiView::Scan;
+  } else {
+    wifi.forget();
+  }
+}
+
+void wifi_scan_ok() {
+  if (s_wifiSel >= s_wifi.apCount) {
+    WifiController::instance().startScan();
+    return;
+  }
+  const WIFI::ApInfo &ap = s_wifi.aps[s_wifiSel];
+  if (!ap.secure) {
+    WifiController::instance().connect(ap.ssid, "");
+    s_wifiView = WifiView::Main;
+    return;
+  }
+  snprintf(s_kbSsid, sizeof(s_kbSsid), "%s", ap.ssid);
+  s_kbText.clear();
+  s_kbPage = 0;
+  s_kbRow = 1;
+  s_kbCol = 0;
+  s_wifiView = WifiView::Keyboard;
+}
+
+void wifi_keyboard_ok() {
+  if (s_kbRow < 4) {
+    if (s_kbText.size() < kKbMaxLen) s_kbText += kKbPages[s_kbPage][s_kbRow][s_kbCol];
+    return;
+  }
+  switch (s_kbCol) {
+    case 0:
+      s_kbPage = (s_kbPage + 1) % 3;
+      break;
+    case 1:
+      if (s_kbText.size() < kKbMaxLen) s_kbText += ' ';
+      break;
+    case 2:
+      if (!s_kbText.empty()) s_kbText.pop_back();
+      break;
+    default:
+      // WPA needs 8+ characters; an empty password is an open network.
+      if (s_kbText.empty() || s_kbText.size() >= 8) {
+        WifiController::instance().connect(s_kbSsid, s_kbText);
+        s_kbText.clear();
+        s_wifiView = WifiView::Main;
+      }
+      break;
+  }
+}
+
+// Handles a key in the Wi-Fi panel. Returns false if the generic panel
+// handling should run instead (main view: row moves, Back leaves).
+bool wifi_key(Key k) {
+  if (!wifi_panel_active()) return false;
+  switch (s_wifiView) {
+    case WifiView::Main:
+      if (k != Key::Ok) return false;
+      wifi_main_ok();
+      break;
+    case WifiView::Qr:
+      if (k == Key::Back) {
+        WifiController::instance().stopSetup();
+        s_wifiView = WifiView::Main;
+      }
+      break;
+    case WifiView::Scan: {
+      const int total = s_wifi.apCount + 1;
+      if (k == Key::Up || k == Key::Left) s_wifiSel = wrap(s_wifiSel - 1, total);
+      else if (k == Key::Down || k == Key::Right) s_wifiSel = wrap(s_wifiSel + 1, total);
+      else if (k == Key::Ok) wifi_scan_ok();
+      else s_wifiView = WifiView::Main;
+      break;
+    }
+    case WifiView::Keyboard:
+      if (k == Key::Up && s_kbRow > 0) s_kbRow--;
+      else if (k == Key::Down && s_kbRow < kKbRows - 1) s_kbRow++;
+      else if (k == Key::Left) s_kbCol = wrap(s_kbCol - 1, kb_row_len(s_kbRow));
+      else if (k == Key::Right) s_kbCol = wrap(s_kbCol + 1, kb_row_len(s_kbRow));
+      else if (k == Key::Ok) wifi_keyboard_ok();
+      else if (k == Key::Back) s_wifiView = WifiView::Scan;
+      if (s_kbCol >= kb_row_len(s_kbRow)) s_kbCol = kb_row_len(s_kbRow) - 1;
+      break;
+  }
+  refresh_content();
+  return true;
+}
+
+// ---- Clock (user sets RTC date + time) --------------------------------
+
+int days_in_month(int y, int m) {
+  static const int kDays[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+  if (m < 1 || m > 12) return 31;
+  return kDays[m];
+}
+
+void clamp_clock_day() {
+  const int maxd = days_in_month(s_data.clock_y, s_data.clock_mo);
+  if (s_data.clock_d > maxd) s_data.clock_d = maxd;
+  if (s_data.clock_d < 1) s_data.clock_d = 1;
+}
+
+void make_clock_field(lv_obj_t *parent, int row, const char *text) {
+  const bool on = s_in_panel && s_panel_row == row;
+  lv_obj_t *box = make_plain(parent);
+  lv_obj_set_height(box, 80);
+  lv_obj_set_flex_grow(box, 1);
+  lv_obj_set_style_radius(box, 14, 0);
+  lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(box, c(on ? PILL_BG : CARD_BG_ALT), 0);
+  lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  apply_focus_frame(box, on);
+  make_label(box, text, &ui_font_xxl, on ? PILL_TEXT : TEXT_PRIMARY);
+}
+
+void build_clock_panel(lv_obj_t *parent) {
+  const int y = s_in_panel ? s_data.clock_y : (s_clockValid ? s_clockY : 2026);
+  const int mo = s_in_panel ? s_data.clock_mo : (s_clockValid ? s_clockMo : 1);
+  const int d = s_in_panel ? s_data.clock_d : (s_clockValid ? s_clockD : 1);
+  const int h = s_in_panel ? s_data.clock_h : (s_clockValid ? s_clockH : 0);
+  const int mi = s_in_panel ? s_data.clock_mi : (s_clockValid ? s_clockM : 0);
+
+  char yb[8], mb[8], db[8], hb[8], mib[8];
+  snprintf(yb, sizeof(yb), "%d", y);
+  snprintf(mb, sizeof(mb), "%02d", mo);
+  snprintf(db, sizeof(db), "%02d", d);
+  snprintf(hb, sizeof(hb), "%02d", h);
+  snprintf(mib, sizeof(mib), "%02d", mi);
+
+  lv_obj_t *date_card = make_card(parent, CARD_BG);
+  lv_obj_set_size(date_card, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_grow(date_card, 0);
+  lv_obj_set_style_pad_all(date_card, 16, 0);
+  lv_obj_set_flex_flow(date_card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(date_card, 12, 0);
+  make_label(date_card, tr("일자", "Date"), &ui_font_sm, TEXT_SECONDARY);
+  lv_obj_t *date_row = make_row(date_card, LV_PCT(100), 80, 8);
+  make_clock_field(date_row, 0, yb);
+  make_label(date_row, ".", &ui_font_xxl, TEXT_DIM);
+  make_clock_field(date_row, 1, mb);
+  make_label(date_row, ".", &ui_font_xxl, TEXT_DIM);
+  make_clock_field(date_row, 2, db);
+
+  lv_obj_t *time_card = make_card(parent, CARD_BG);
+  lv_obj_set_size(time_card, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_grow(time_card, 0);
+  lv_obj_set_style_pad_all(time_card, 16, 0);
+  lv_obj_set_flex_flow(time_card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(time_card, 12, 0);
+  make_label(time_card, tr("시간", "Time"), &ui_font_sm, TEXT_SECONDARY);
+  lv_obj_t *time_row = make_row(time_card, LV_PCT(100), 80, 8);
+  make_clock_field(time_row, 3, hb);
+  make_label(time_row, ":", &ui_font_xxl, TEXT_DIM);
+  make_clock_field(time_row, 4, mib);
+  make_label(time_row, h < 12 ? "AM" : "PM", &ui_font_md, TEXT_SECONDARY);
+
+  make_label(parent, tr("* ▲▼ 변경  ◀▶ 이동  OK 저장", "* Up/Down change, Left/Right move, OK save"),
+             &ui_font_xs, TEXT_DIM);
+}
+
+// ---- Language section ---------------------------------------------------
+// Left/Right picks 한국어 / English; OK saves it, and main.cpp rebuilds the
+// screens in the new language (see take_language_changed()).
+
+void build_language_panel(lv_obj_t *parent) {
+  const int lang = s_in_panel ? s_data.lang : (int)ui_lang::get();
+
+  lv_obj_t *card = make_card(parent, CARD_BG);
+  lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_grow(card, 0);
+  lv_obj_set_style_pad_all(card, 16, 0);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 12, 0);
+  make_label(card, tr("화면 언어", "Display Language"), &ui_font_sm, TEXT_SECONDARY);
+
+  lv_obj_t *row = make_row(card, LV_PCT(100), 80, 10);
+  apply_focus_frame(row, true);
+  make_mode_option(row, "한국어", "", lang == (int)ui_lang::Lang::Ko);
+  make_mode_option(row, "English", "", lang == (int)ui_lang::Lang::En);
+
+  make_label(parent, tr("* OK = 저장 후 바로 적용", "* Applied when you press OK"), &ui_font_xs,
+             TEXT_DIM);
 }
 
 // ---- Placeholder sections (not yet designed) --------------------------
@@ -708,6 +1183,24 @@ void build_placeholder_panel(lv_obj_t *parent, const char *label) {
 
 // ---- Engineer Mode (nested sub-area) -----------------------------------
 
+void make_pin_boxes(lv_obj_t *parent, const int digits[4], int pos, bool reveal) {
+  lv_obj_t *row = make_row(parent, LV_PCT(80), 80, 10);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  for (int i = 0; i < 4; i++) {
+    const bool on = reveal && pos == i;
+    lv_obj_t *box = make_plain(row);
+    lv_obj_set_size(box, 56, 72);
+    lv_obj_set_style_radius(box, 12, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(box, c(on ? PILL_BG : CARD_BG_ALT), 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    apply_focus_frame(box, on);
+    char d[2] = {reveal ? (char)('0' + digits[i]) : '*', 0};
+    make_label(box, d, &ui_font_xxl, on ? PILL_TEXT : TEXT_PRIMARY);
+  }
+}
+
 // Shown in the OUTER content panel when "기기 설정" is highlighted but not
 // yet entered - OK drills into its own nested sidebar (see enter_engineer).
 void build_engineer_portal_panel(lv_obj_t *parent) {
@@ -716,11 +1209,44 @@ void build_engineer_portal_panel(lv_obj_t *parent) {
   lv_obj_set_flex_grow(card, 1);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(card, 10, 0);
+  lv_obj_set_style_pad_row(card, 12, 0);
 
   ui_icons::lock(card, 28, c(TEXT_SECONDARY));
-  make_label(card, "기기 설정 (Engineer Mode)", &ui_font_sm, TEXT_PRIMARY);
-  make_label(card, "OK 버튼으로 진입 (Press OK to enter)", &ui_font_xs, TEXT_DIM);
+  make_label(card, tr("기기 설정", "Engineer Mode"), &ui_font_sm, TEXT_PRIMARY);
+
+  if (!s_pinOpen) {
+    make_label(card, tr("OK = 4자리 PIN", "OK = 4-digit PIN"), &ui_font_xs, TEXT_DIM);
+    return;
+  }
+
+  make_label(card, "PIN", &ui_font_sm, TEXT_SECONDARY);
+  make_pin_boxes(card, s_pinDigit, s_pinPos, true);
+  if (s_pinWrong) make_label(card, tr("PIN 실패", "Wrong PIN"), &ui_font_sm, DANGER);
+  else make_label(card, tr("* ▲▼ 변경  ◀▶ 이동  OK 확인", "* Up/Down change, Left/Right move, OK"),
+                  &ui_font_xs, TEXT_DIM);
+}
+
+void build_engineer_pin_panel(lv_obj_t *parent) {
+  lv_obj_t *card = make_card(parent, CARD_BG);
+  lv_obj_set_size(card, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_flex_grow(card, 1);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(card, 12, 0);
+
+  ui_icons::lock(card, 28, c(TEXT_SECONDARY));
+  make_label(card, tr("PIN 변경", "Change PIN"), &ui_font_sm, TEXT_PRIMARY);
+
+  int digits[4] = {};
+  digits_from_pin(s_in_panel ? s_data.pin : s_savedPin, digits);
+  make_pin_boxes(card, digits, s_panel_row, s_in_panel);
+
+  if (s_in_panel) {
+    make_label(card, tr("* ▲▼ 변경  ◀▶ 이동  OK 저장", "* Up/Down change, Left/Right move, OK save"),
+               &ui_font_xs, TEXT_DIM);
+  } else {
+    make_label(card, tr("OK = PIN 변경", "OK = change PIN"), &ui_font_xs, TEXT_DIM);
+  }
 }
 
 // "ID 설정 (RS-485 ID)" - fully designed, per the reference mockup.
@@ -731,10 +1257,14 @@ void build_engineer_id_panel(lv_obj_t *parent) {
   lv_obj_set_flex_flow(current, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(current, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_row(current, 4, 0);
-  char current_buf[24];
-  snprintf(current_buf, sizeof(current_buf), "현재 ID : %02d", s_snap.eng_id);
+  char current_buf[40];
+  const char *cur = tr("현재 ID", "Current ID");
+  if (s_rc.deviceId == 0) {
+    snprintf(current_buf, sizeof(current_buf), "%s : 00 (%s)", cur, tr("기본값", "Default"));
+  } else {
+    snprintf(current_buf, sizeof(current_buf), "%s : %d (0x%02X)", cur, s_rc.deviceId, s_rc.deviceId);
+  }
   make_label(current, current_buf, &ui_font_xxl, TEXT_PRIMARY);
-  make_label(current, "(Current ID)", &ui_font_sm, TEXT_SECONDARY);
 
   lv_obj_t *stepper = make_card(parent, CARD_BG);
   lv_obj_set_size(stepper, LV_PCT(100), 110);
@@ -753,7 +1283,7 @@ void build_engineer_id_panel(lv_obj_t *parent) {
   lv_obj_t *idRow = make_row(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
   make_label(idRow, "ID", &ui_font_sm, TEXT_SECONDARY);
   char id_buf[12];
-  snprintf(id_buf, sizeof(id_buf), "[ %02d ]", s_data.eng_id);
+  snprintf(id_buf, sizeof(id_buf), "[ %d ]", s_data.eng_id);
   make_label(idRow, id_buf, &ui_font_md, TEXT_PRIMARY);
 
   lv_obj_t *plus = make_card(row, CARD_BG_ALT);
@@ -761,9 +1291,11 @@ void build_engineer_id_panel(lv_obj_t *parent) {
   lv_obj_set_flex_align(plus, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   make_label(plus, "+", &ui_font_md, TEXT_PRIMARY);
 
-  make_label(stepper, "(설정 범위: 00 ~ 15 / Hex 0x00 ~ 0x0F)", &ui_font_xs, TEXT_DIM);
+  make_label(stepper, tr("(설정 범위: 1 ~ 99, OK = 저장)", "(Range: 1 ~ 99, OK = Save)"), &ui_font_xs, TEXT_DIM);
 
-  make_label(parent, "* 단지 홈네트워크 RS-485 통신 국번 설정 (중복 주의)", &ui_font_xs, TEXT_DIM);
+  make_label(parent, "* PLC B5 ID byte = same number (98 -> 0x62). Must match MAIN.", &ui_font_xs, TEXT_DIM);
+  make_label(parent, tr("* PC (RS-485) 도 같은 ID 사용 - PC 는 1~32 만 지원", "* PC (RS-485) uses the same ID - PC supports 1~32 only"),
+             &ui_font_xs, s_data.eng_id > RS485_ID_DOC_MAX && s_in_panel ? WARN : TEXT_DIM);
 }
 
 // "VSP 설정 (Motor VSP)" - fully designed, per the reference mockup.
@@ -825,14 +1357,66 @@ void build_fan_voltage_card(lv_obj_t *parent, const char *header, int selected_i
   }
 }
 
-void build_engineer_vsp_panel(lv_obj_t *parent) {
-  make_label(parent, "급기 - Supply Air", &ui_font_md, TEXT_PRIMARY);
-  build_fan_voltage_card(parent, "급기 팬 (Supply Fan)", s_data.vsp_supply, "[ 강 : 4.8 V ]", "[ 중 : 3.2 V ]",
-                        "[ 약 : 1.8 V ]", true, s_panel_row == 0);
+// "[ 강 : 2.45 V ]" from a value in 0.05 V units (V x 20).
+void format_vsp(char *buf, size_t n, const char *level, int units) {
+  const int cv = units * 5;
+  snprintf(buf, n, "[ %s : %d.%02d V ]", level, cv / 100, cv % 100);
+}
 
-  make_label(parent, "배기 - Exhaust Air", &ui_font_md, TEXT_PRIMARY);
-  build_fan_voltage_card(parent, "배기 팬 (Exhaust Fan)", s_data.vsp_exhaust, "[ 강 : 4.6 V ]", "[ 중 : 3.0 V ]",
-                        "[ 약 : 1.6 V ]", false, s_panel_row == 1);
+// VSP buffer in old RC order (see SettingsData::vsp).
+void vsp_from_state(int out[12]) {
+  const uint8_t v[12] = {s_rc.vspExhaustL,   s_rc.vspExhaustM,   s_rc.vspExhaustH,
+                         s_rc.vspSupplyL,    s_rc.vspSupplyM,    s_rc.vspSupplyH,
+                         s_rc.vspBpExhaustL, s_rc.vspBpExhaustM, s_rc.vspBpExhaustH,
+                         s_rc.vspBpSupplyL,  s_rc.vspBpSupplyM,  s_rc.vspBpSupplyH};
+  for (int i = 0; i < 12; i++) out[i] = v[i];
+}
+
+// Volts string for the controller ("2.45").
+std::string vsp_volts(int units) {
+  char b[24];
+  const int cv = units * 5;
+  snprintf(b, sizeof(b), "%d.%02d", cv / 100, cv % 100);
+  return b;
+}
+
+// Old RC VSP setting (SHR-L2 3.1): Left/Right steps through
+// [전열 배기] 약 중 강 -> [전열 급기] -> [바이패스 배기] -> [바이패스 급기],
+// Up/Down changes the selected value by 0.05 V, OK saves, Back cancels.
+void build_engineer_vsp_panel(lv_obj_t *parent) {
+  int v[12];
+  if (s_in_panel) {
+    for (int i = 0; i < 12; i++) v[i] = s_data.vsp[i];
+  } else {
+    vsp_from_state(v);
+  }
+  const int slot = s_in_panel ? s_data.vsp_slot : -1;
+  const bool bypass = slot >= 6;
+  const int exhGroup = bypass ? 2 : 0;
+  const int supGroup = bypass ? 3 : 1;
+  const char *tag = bypass ? tr(" [바이패스]", " [Bypass]") : tr(" [전열]", " [Heat Recovery]");
+  // selected_idx in build_fan_voltage_card: 0 = 강, 1 = 중, 2 = 약
+  const int supSel = (slot >= 0 && slot / 3 == supGroup) ? 2 - slot % 3 : -1;
+  const int exhSel = (slot >= 0 && slot / 3 == exhGroup) ? 2 - slot % 3 : -1;
+  const char *hi = tr("강", "High");
+  const char *mid = tr("중", "Mid");
+  const char *lo = tr("약", "Low");
+
+  char title[48], h[28], m[28], l[28];
+  snprintf(title, sizeof(title), "%s%s", tr("급기", "Supply Air"), tag);
+  make_label(parent, title, &ui_font_md, TEXT_PRIMARY);
+  format_vsp(h, sizeof(h), hi, v[supGroup * 3 + 2]);
+  format_vsp(m, sizeof(m), mid, v[supGroup * 3 + 1]);
+  format_vsp(l, sizeof(l), lo, v[supGroup * 3 + 0]);
+  build_fan_voltage_card(parent, tr("급기 팬", "Supply Fan"), supSel, h, m, l, supSel >= 0, supSel >= 0);
+
+  snprintf(title, sizeof(title), "%s%s", tr("배기", "Exhaust Air"), tag);
+  make_label(parent, title, &ui_font_md, TEXT_PRIMARY);
+  format_vsp(h, sizeof(h), hi, v[exhGroup * 3 + 2]);
+  format_vsp(m, sizeof(m), mid, v[exhGroup * 3 + 1]);
+  format_vsp(l, sizeof(l), lo, v[exhGroup * 3 + 0]);
+  build_fan_voltage_card(parent, tr("배기 팬", "Exhaust Fan"), exhSel, h, m, l, exhSel >= 0,
+                         exhSel >= 0);
 }
 
 void restyle_eng_menu_item(int idx) {
@@ -840,12 +1424,12 @@ void restyle_eng_menu_item(int idx) {
   lv_obj_set_style_border_color(s_engMenuCards[idx], c(selected ? ACCENT_CYAN : BORDER), 0);
   lv_obj_set_style_border_width(s_engMenuCards[idx], selected ? 2 : 1, 0);
   lv_obj_set_style_text_color(s_engMenuTitles[idx], c(selected ? ACCENT_CYAN : TEXT_PRIMARY), 0);
-  lv_obj_set_style_text_color(s_engMenuSubtitles[idx], c(selected ? ACCENT_CYAN : TEXT_SECONDARY), 0);
+  if (s_engMenuSubtitles[idx]) {
+    lv_obj_set_style_text_color(s_engMenuSubtitles[idx], c(selected ? ACCENT_CYAN : TEXT_SECONDARY), 0);
+  }
 }
 
 lv_obj_t *build_eng_menu_item(lv_obj_t *parent, int idx) {
-  const EngMenuItem &item = kEngMenu[idx];
-
   lv_obj_t *card = make_card(parent, CARD_BG);
   lv_obj_set_size(card, LV_PCT(100), LV_PCT(100));
   lv_obj_set_flex_grow(card, 1);
@@ -854,8 +1438,8 @@ lv_obj_t *build_eng_menu_item(lv_obj_t *parent, int idx) {
   lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
   s_engMenuCards[idx] = card;
 
-  s_engMenuTitles[idx] = make_label(card, item.title, &ui_font_sm, TEXT_PRIMARY);
-  s_engMenuSubtitles[idx] = make_label(card, item.subtitle, &ui_font_xs, TEXT_SECONDARY);
+  s_engMenuTitles[idx] = make_label(card, eng_menu_title(idx), &ui_font_sm, TEXT_PRIMARY);
+  s_engMenuSubtitles[idx] = nullptr;
 
   restyle_eng_menu_item(idx);
   return card;
@@ -870,6 +1454,10 @@ void build_engineer_content_for(int idx) {
       break;
     case 1:
       build_engineer_vsp_panel(s_contentPanel);
+      set_footer();
+      break;
+    case 2:
+      build_engineer_pin_panel(s_contentPanel);
       set_footer();
       break;
     default:
@@ -893,11 +1481,19 @@ void build_content_for(int idx) {
       set_footer();
       break;
     case 3:
-      build_engineer_portal_panel(s_contentPanel);
+      build_filter_panel(s_contentPanel);
       set_footer();
       break;
     case 4:
-      build_filter_panel(s_contentPanel);
+      build_clock_panel(s_contentPanel);
+      set_footer();
+      break;
+    case 5:
+      build_language_panel(s_contentPanel);
+      set_footer();
+      break;
+    case 6:
+      build_engineer_portal_panel(s_contentPanel);
       set_footer();
       break;
     default:
@@ -917,7 +1513,7 @@ void restyle_menu_item(int idx) {
   lv_obj_set_style_bg_color(s_menuCards[idx], c(selected ? CARD_BG : CARD_BG), 0);
 
   lv_obj_set_style_text_color(s_menuTitles[idx], c(titleColor), 0);
-  lv_obj_set_style_text_color(s_menuSubtitles[idx], c(subColor), 0);
+  if (s_menuSubtitles[idx]) lv_obj_set_style_text_color(s_menuSubtitles[idx], c(subColor), 0);
 }
 
 lv_obj_t *build_menu_item(lv_obj_t *parent, int idx) {
@@ -926,16 +1522,17 @@ lv_obj_t *build_menu_item(lv_obj_t *parent, int idx) {
   lv_obj_t *card = make_card(parent, CARD_BG);
   lv_obj_set_size(card, LV_PCT(100), LV_PCT(100));
   lv_obj_set_flex_grow(card, 1);
-  lv_obj_set_style_pad_all(card, 14, 0);
+  // 7 items share the sidebar height, so keep the vertical padding small.
+  lv_obj_set_style_pad_hor(card, 14, 0);
+  lv_obj_set_style_pad_ver(card, 2, 0);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
   s_menuCards[idx] = card;
 
   lv_obj_t *titleRow = make_row(card, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
-  s_menuTitles[idx] = make_label(titleRow, item.title, &ui_font_sm, TEXT_PRIMARY);
+  s_menuTitles[idx] = make_label(titleRow, menu_title(idx), &ui_font_sm, TEXT_PRIMARY);
   if (item.locked) ui_icons::lock(titleRow, 16, c(TEXT_SECONDARY));
-
-  s_menuSubtitles[idx] = make_label(card, item.subtitle, &ui_font_xs, TEXT_SECONDARY);
+  s_menuSubtitles[idx] = nullptr;
 
   restyle_menu_item(idx);
   return card;
@@ -943,7 +1540,7 @@ lv_obj_t *build_menu_item(lv_obj_t *parent, int idx) {
 
 void build_sidebar_outer(lv_obj_t *parent) {
   lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(parent, 10, 0);
+  lv_obj_set_style_pad_row(parent, 6, 0);
   for (int i = 0; i < kMenuCount; i++) build_menu_item(parent, i);
 }
 
@@ -958,9 +1555,12 @@ void build_sidebar_engineer(lv_obj_t *parent) {
 // the lock/Wi-Fi icons (Engineer Mode shows a lock, not the Wi-Fi glyph).
 void update_breadcrumb() {
   bool eng = (s_mode == Mode::Engineer);
-  if (s_breadcrumbRoot) lv_label_set_text(s_breadcrumbRoot, eng ? "기기설정 (ENGINEER MODE)" : "설정 (SETTINGS)");
+  if (s_breadcrumbRoot) {
+    lv_label_set_text(s_breadcrumbRoot, eng ? tr("기기설정", "ENGINEER MODE")
+                                            : tr("설정", "SETTINGS"));
+  }
   if (s_breadcrumbSection) {
-    lv_label_set_text(s_breadcrumbSection, eng ? kEngMenu[s_engSelected].title : kMenu[s_selected].title);
+    lv_label_set_text(s_breadcrumbSection, eng ? eng_menu_title(s_engSelected) : menu_title(s_selected));
   }
   if (s_breadcrumbLock) {
     if (eng) lv_obj_clear_flag(s_breadcrumbLock, LV_OBJ_FLAG_HIDDEN);
@@ -986,15 +1586,16 @@ void build_breadcrumb(lv_obj_t *parent) {
 
   lv_obj_t *left = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 8);
   make_label(left, LV_SYMBOL_LEFT, &lv_font_montserrat_20, TEXT_SECONDARY);
-  s_breadcrumbRoot = make_label(left, "설정 (SETTINGS)", &ui_font_sm, TEXT_PRIMARY);
+  s_breadcrumbRoot = make_label(left, tr("설정", "SETTINGS"), &ui_font_sm, TEXT_PRIMARY);
   make_label(left, LV_SYMBOL_RIGHT, &lv_font_montserrat_20, TEXT_DIM);
-  s_breadcrumbSection = make_label(left, kMenu[0].title, &ui_font_sm, TEXT_SECONDARY);
+  s_breadcrumbSection = make_label(left, menu_title(s_selected), &ui_font_sm, TEXT_SECONDARY);
 
   lv_obj_t *right = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 8);
   s_breadcrumbLock = ui_icons::lock(right, 18, c(TEXT_SECONDARY));
   lv_obj_add_flag(s_breadcrumbLock, LV_OBJ_FLAG_HIDDEN); // shown only in Engineer Mode
-  make_label(right, "PM 04:40", &ui_font_sm, TEXT_SECONDARY);
+  s_breadcrumbTime = make_label(right, "--", &ui_font_sm, TEXT_SECONDARY);
   s_breadcrumbWifi = ui_icons::wifi(right, 20, c(TEXT_PRIMARY));
+  lv_obj_set_style_opa(s_breadcrumbWifi, s_wifi.connected() ? LV_OPA_COVER : LV_OPA_40, 0);
 }
 
 void build_footer(lv_obj_t *parent) {
@@ -1040,30 +1641,82 @@ void footer_add_icons(const char *icons, const char *text) {
 void set_footer() {
   if (!s_footerBar) return; // footer bar not built yet - see create()'s ordering note
   lv_obj_clean(s_footerBar);
-  if (s_in_panel) {
-    footer_add_ok("저장 (Save)");
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 1) {
+    footer_add_ok(tr("예약 시작", "Start"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_UP LV_SYMBOL_RIGHT, "선택/이동");
+    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_RIGHT, tr("변경", "Change"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_NEW_LINE, "취소");
-  } else if (s_mode == Mode::Outer && s_selected == 3) {
-    footer_add_ok("진입 (Enter)");
+    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("이동", "Move"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, "메뉴");
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("취소", "Cancel"));
+  } else if (s_in_panel && s_mode == Mode::Outer && s_selected == 2) {
+    switch (s_wifiView) {
+      case WifiView::Qr:
+        footer_add_icons(LV_SYMBOL_NEW_LINE, tr("설정 종료", "Exit setup"));
+        break;
+      case WifiView::Scan:
+        footer_add_ok(tr("선택", "Select"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("이동", "Move"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_NEW_LINE, tr("뒤로", "Back"));
+        break;
+      case WifiView::Keyboard:
+        footer_add_ok(tr("입력", "Type"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_UP LV_SYMBOL_DOWN LV_SYMBOL_RIGHT, tr("이동", "Move"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_NEW_LINE, tr("뒤로", "Back"));
+        break;
+      default:
+        footer_add_ok(tr("실행", "Run"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_UP LV_SYMBOL_RIGHT, tr("선택", "Select"));
+        footer_add_sep();
+        footer_add_icons(LV_SYMBOL_NEW_LINE, tr("뒤로", "Back"));
+        break;
+    }
+  } else if (s_in_panel && s_mode == Mode::Engineer && s_engSelected == 2) {
+    footer_add_ok(tr("저장", "Save"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_NEW_LINE, "나가기");
+    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("변경", "Change"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_RIGHT, tr("이동", "Move"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("취소", "Cancel"));
+  } else if (s_in_panel) {
+    footer_add_ok(tr("저장", "Save"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_UP LV_SYMBOL_RIGHT, tr("선택/이동", "Select/Move"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("취소", "Cancel"));
+  } else if (s_mode == Mode::Outer && s_selected == 6 && s_pinOpen) {
+    footer_add_ok(tr("확인", "OK"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("변경", "Change"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_RIGHT, tr("이동", "Move"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("취소", "Cancel"));
+  } else if (s_mode == Mode::Outer && s_selected == 6) {
+    footer_add_ok(tr("PIN 입력", "Enter PIN"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("메뉴", "Menu"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("나가기", "Exit"));
   } else {
-    footer_add_ok("선택 (Enter)");
+    footer_add_ok(tr("선택", "Enter"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, "메뉴");
+    footer_add_icons(LV_SYMBOL_UP LV_SYMBOL_DOWN, tr("메뉴", "Menu"));
     footer_add_sep();
-    footer_add_icons(LV_SYMBOL_NEW_LINE, "나가기");
+    footer_add_icons(LV_SYMBOL_NEW_LINE, tr("나가기", "Exit"));
   }
 }
 
 } // namespace
 
 lv_obj_t *create() {
+  load_pin();
   lv_obj_t *scr = lv_obj_create(NULL);
   lv_obj_remove_style_all(scr);
   lv_obj_set_style_bg_color(scr, c(BG), 0);
@@ -1095,12 +1748,22 @@ lv_obj_t *create() {
   snapshot_data();
   build_content_for(s_selected);
 
+  s_screen = scr;
   return scr;
+}
+
+void set_state(const RcDto &state) {
+  s_rc = state;
+  // The Wi-Fi page shows no RC state; skip it so the QR code / keyboard are
+  // not rebuilt on every PLC frame.
+  const bool wifiPage = s_mode == Mode::Outer && s_selected == 2;
+  if (s_screen && lv_scr_act() == s_screen && !wifiPage) refresh_content();
 }
 
 void select_menu(int idx) {
   if (s_mode != Mode::Outer || s_in_panel) return;
   if (idx < 0 || idx >= kMenuCount || idx == s_selected) return;
+  if (s_pinOpen) pin_reset();
   s_selected = idx;
   for (int i = 0; i < kMenuCount; i++) restyle_menu_item(i);
   update_breadcrumb();
@@ -1134,7 +1797,8 @@ void select_prev() {
 bool is_in_engineer() { return s_mode == Mode::Engineer; }
 
 void enter_engineer() {
-  if (s_mode != Mode::Outer || s_selected != 3) return; // only from the Engineer Mode portal
+  if (s_mode != Mode::Outer || s_selected != 6) return; // only from the Engineer Mode portal
+  pin_reset();
   s_mode = Mode::Engineer;
   s_engSelected = 0;
   s_in_panel = false;
@@ -1151,6 +1815,7 @@ void exit_engineer() {
   s_in_panel = false;
   s_panel_row = 0;
   s_mode = Mode::Outer;
+  pin_reset();
 
   lv_obj_clean(s_sidebarSlot);
   build_sidebar_outer(s_sidebarSlot);
@@ -1186,17 +1851,45 @@ void refresh_content() {
 
 void enter_panel() {
   if (s_in_panel) return;
-  // AHU control: seed the local pick from whatever's actually confirmed,
-  // so editing starts from reality instead of a stale pick from the last
-  // visit. Left as-is (0/1/false) if nothing has ever been confirmed -
-  // the panel shows that plainly via the confirmed badge.
+  s_wifiView = WifiView::Main;
+  // Seed the local pick from the current RC state.
   if (s_mode == Mode::Outer && s_selected == 0) {
-    if (s_ahuModeEverConfirmed) {
-      s_data.ahu_mode = s_confirmedMode;
-      s_data.ahu_volume = s_confirmedVolume;
-    }
-    if (s_ahuCleanEverConfirmed) s_data.ahu_clean = s_confirmedClean;
+    s_data.ahu_mode = s_rc.uiMode();
+    s_data.ahu_volume = s_rc.volume == 0 ? 1 : s_rc.volume;
   }
+  if (s_mode == Mode::Outer && s_selected == 1) {
+    s_data.resv_type = 0;
+    s_data.resv_min = s_rc.startMin >= RC_RESERVE_STEP_MIN ? s_rc.startMin : 60;
+  }
+  if (s_mode == Mode::Outer && s_selected == 3) {
+    s_data.filter_init = s_rc.filterInit;
+  }
+  if (s_mode == Mode::Outer && s_selected == 4) {
+    if (sensors::hasRtc()) {
+      s_data.clock_y = sensors::getYear();
+      s_data.clock_mo = sensors::getMonth();
+      s_data.clock_d = sensors::getDay();
+      s_data.clock_h = sensors::getHour24();
+      s_data.clock_mi = sensors::getMinute();
+    }
+    if (s_data.clock_y < 2020 || s_data.clock_y > 2099) s_data.clock_y = 2026;
+    if (s_data.clock_mo < 1 || s_data.clock_mo > 12) s_data.clock_mo = 1;
+    clamp_clock_day();
+  }
+  if (s_mode == Mode::Outer && s_selected == 5) {
+    s_data.lang = (int)ui_lang::get();
+  }
+  if (s_mode == Mode::Engineer && s_engSelected == 0) {
+    s_data.eng_id = s_rc.deviceId == 0 ? 1 : s_rc.deviceId;
+  }
+  if (s_mode == Mode::Engineer && s_engSelected == 1) {
+    vsp_from_state(s_data.vsp);
+    s_data.vsp_slot = 0;
+  }
+  if (s_mode == Mode::Engineer && s_engSelected == 2) {
+    s_data.pin = s_savedPin;
+  }
+  s_ahuResultMsg = nullptr;
   snapshot_data();
   s_in_panel = true;
   s_panel_row = 0;
@@ -1206,18 +1899,29 @@ void enter_panel() {
 void leave_panel(bool save) {
   if (!s_in_panel) return;
   if (save) {
-    if (s_mode == Mode::Outer && s_selected == 2) {
-      if (s_panel_row == 0) s_data.wifi_action = 1;
-      else if (s_panel_row == 1) s_data.wifi_action = 2;
-      else {
-        s_data.wifi_action = 3;
-        s_data.wifi_connected = false;
-      }
-      if (s_data.wifi_action == 1 || s_data.wifi_action == 2) s_data.wifi_connected = true;
-    }
     if (s_mode == Mode::Outer && s_selected == 4) {
-      s_data.filter_pct = 100;
-      s_data.filter_hours = 0;
+      sensors::setRtcTime(s_data.clock_y, s_data.clock_mo, s_data.clock_d, s_data.clock_h,
+                          s_data.clock_mi, 0);
+    }
+    if (s_mode == Mode::Outer && s_selected == 5) {
+      if (ui_lang::set((ui_lang::Lang)s_data.lang)) s_langChanged = true;
+    }
+    if (s_mode == Mode::Engineer && s_engSelected == 0) {
+      RcController::instance().setDeviceId(s_data.eng_id);
+    }
+    if (s_mode == Mode::Engineer && s_engSelected == 1) {
+      const int *v = s_data.vsp;
+      RcController &rc = RcController::instance();
+      rc.setVspSetting(vsp_volts(v[2]), vsp_volts(v[1]), vsp_volts(v[0]), vsp_volts(v[5]), vsp_volts(v[4]),
+                       vsp_volts(v[3]));
+      rc.setVspBypassSetting(vsp_volts(v[8]), vsp_volts(v[7]), vsp_volts(v[6]), vsp_volts(v[11]),
+                             vsp_volts(v[10]), vsp_volts(v[9]));
+    }
+    if (s_mode == Mode::Engineer && s_engSelected == 2) {
+      save_pin(s_data.pin);
+    }
+    if (s_mode == Mode::Outer && s_selected == 3) {
+      RcController::instance().setFilterInitial(s_data.filter_init);
     }
     snapshot_data();
   } else {
@@ -1229,17 +1933,23 @@ void leave_panel(bool save) {
 }
 
 int panel_row_count() {
-  if (s_mode == Mode::Engineer) return (s_engSelected == 0) ? 1 : 2;
+  if (s_mode == Mode::Engineer) {
+    if (s_engSelected == 0) return 1;
+    if (s_engSelected == 2) return 4;
+    return 2;
+  }
   switch (s_selected) {
-    case 0: return 3; // AHU control: mode / volume / clean
-    case 1: return 4; // AHU reservation: start-hour / stop-hour / start action / stop action
+    case 0: return 2; // mode / fan volume
+    case 1: return 2; // reservation: type / time
     case 2: return 3; // wifi: pair / scan / disconnect
-    case 4: return 1; // filter: reset
+    case 3: return 1; // filter: reset
+    case 4: return 5; // clock: y/m/d/h/min
+    case 5: return 1; // language
     default: return 1;
   }
 }
 
-void change_id(int delta) { s_data.eng_id = wrap(s_data.eng_id + delta, 16); }
+void change_id(int delta) { s_data.eng_id = wrap(s_data.eng_id - 1 + delta, 99) + 1; }
 
 // Mode/volume/clean (case 0) fire their backend call immediately here -
 // "cycled by button", not an edit deferred to OK. Reservation hour
@@ -1250,9 +1960,13 @@ void panel_adjust(int delta) {
   if (s_mode == Mode::Engineer) {
     if (s_engSelected == 0) {
       change_id(delta);
+    } else if (s_engSelected == 2) {
+      int d[4] = {};
+      digits_from_pin(s_data.pin, d);
+      d[s_panel_row] = wrap(d[s_panel_row] + delta, 10);
+      s_data.pin = pin_from_digits(d);
     } else {
-      int *level = (s_panel_row == 0) ? &s_data.vsp_supply : &s_data.vsp_exhaust;
-      *level = wrap(*level + delta, 3);
+      s_data.vsp_slot = wrap(s_data.vsp_slot + delta, 12);
     }
     refresh_content();
     return;
@@ -1261,16 +1975,40 @@ void panel_adjust(int delta) {
   switch (s_selected) {
     case 0:
       // Local pick only - nothing is sent until OK (see handle_ok()).
-      if (s_panel_row == 0) s_data.ahu_mode = wrap(s_data.ahu_mode + delta, 4);
-      else if (s_panel_row == 1) s_data.ahu_volume = wrap(s_data.ahu_volume + delta, 4);
-      else s_data.ahu_clean = !s_data.ahu_clean;
+      if (s_panel_row == 0) s_data.ahu_mode = wrap(s_data.ahu_mode + delta, RC::UI_MODE_COUNT);
+      else s_data.ahu_volume = wrap(s_data.ahu_volume - 1 + delta, 3) + 1;
       break;
-    case 1:
-      if (s_panel_row == 0) s_data.ahu_start_hour = wrap(s_data.ahu_start_hour + delta, 24);
-      else if (s_panel_row == 1) s_data.ahu_stop_hour = wrap(s_data.ahu_stop_hour + delta, 24);
+    case 1: {
+      const int steps = RC_RESERVE_MAX_MIN / RC_RESERVE_STEP_MIN;
+      if (s_panel_row == 0) {
+        s_data.resv_type = wrap(s_data.resv_type + delta, 4);
+      } else if (s_panel_row == 1 && s_data.resv_type <= 1) {
+        const int idx = wrap(s_data.resv_min / RC_RESERVE_STEP_MIN - 1 + delta, steps);
+        s_data.resv_min = (idx + 1) * RC_RESERVE_STEP_MIN;
+      }
+      break;
+    }
+    case 3:
+      // Initial value fixed at 2,000 h for now (RC_FILTER_INIT_FIXED): OK only resets.
+      if (!RC_FILTER_INIT_FIXED) {
+        s_data.filter_init = wrap(s_data.filter_init - RC_FILTER_INIT_MIN + delta,
+                                  RC_FILTER_INIT_MAX - RC_FILTER_INIT_MIN + 1) + RC_FILTER_INIT_MIN;
+      }
       break;
     case 2:
       s_panel_row = wrap(s_panel_row + delta, 3);
+      break;
+    case 4:
+      if (s_panel_row == 0) s_data.clock_y = wrap(s_data.clock_y - 2020 + delta, 80) + 2020;
+      else if (s_panel_row == 1) s_data.clock_mo = wrap(s_data.clock_mo - 1 + delta, 12) + 1;
+      else if (s_panel_row == 2) {
+        s_data.clock_d = wrap(s_data.clock_d - 1 + delta, days_in_month(s_data.clock_y, s_data.clock_mo)) + 1;
+      } else if (s_panel_row == 3) s_data.clock_h = wrap(s_data.clock_h + delta, 24);
+      else s_data.clock_mi = wrap(s_data.clock_mi + delta, 60);
+      clamp_clock_day();
+      break;
+    case 5:
+      s_data.lang = wrap(s_data.lang + delta, 2);
       break;
     default:
       break;
@@ -1284,13 +2022,68 @@ void panel_move_row(int delta) {
     refresh_content();
     return;
   }
+  if (s_mode == Mode::Engineer && s_engSelected == 1) {
+    // Up raises the value (delta -1 = Up key), 0.05 V per press, kept inside 0.5..5.5 V
+    int &val = s_data.vsp[s_data.vsp_slot];
+    val -= delta;
+    if (val <= RC::VSP_MIN) val = RC::VSP_MIN + 1;
+    if (val >= RC::VSP_MAX) val = RC::VSP_MAX - 1;
+    refresh_content();
+    return;
+  }
   s_panel_row = wrap(s_panel_row + delta, panel_row_count());
   refresh_content();
 }
 
 bool is_in_panel() { return s_in_panel; }
 
+bool take_language_changed() {
+  const bool changed = s_langChanged;
+  s_langChanged = false;
+  return changed;
+}
+
+void set_time(int year, int month, int day, int hour24, int minute) {
+  s_clockValid = true;
+  s_clockY = year;
+  s_clockMo = month;
+  s_clockD = day;
+  s_clockH = hour24;
+  s_clockM = minute;
+  if (!s_breadcrumbTime) return;
+  int hour12 = hour24 % 12;
+  if (hour12 == 0) hour12 = 12;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d/%02d/%02d %s %02d:%02d", year, month, day, hour24 < 12 ? "AM" : "PM", hour12,
+           minute);
+  lv_label_set_text(s_breadcrumbTime, buf);
+}
+
+void set_wifi_state(const WifiDto &state) {
+  const bool wasSetup = s_wifi.setup;
+  s_wifi = state;
+  // Setup mode ended (connected, timed out): back to the status page.
+  if (s_wifiView == WifiView::Qr && wasSetup && !state.setup) s_wifiView = WifiView::Main;
+  if (s_breadcrumbWifi) lv_obj_set_style_opa(s_breadcrumbWifi, state.connected() ? LV_OPA_COVER : LV_OPA_40, 0);
+  if (s_screen && lv_scr_act() == s_screen && s_mode == Mode::Outer && s_selected == 2) refresh_content();
+}
+
 void handle_up() {
+  if (wifi_key(Key::Up)) return;
+  if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
+    s_pinDigit[s_pinPos] = wrap(s_pinDigit[s_pinPos] + 1, 10);
+    s_pinWrong = false;
+    refresh_content();
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Engineer && s_engSelected == 2) {
+    panel_adjust(1);
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 4) {
+    panel_adjust(1);
+    return;
+  }
   if (s_in_panel) {
     panel_move_row(-1);
     return;
@@ -1300,6 +2093,21 @@ void handle_up() {
 }
 
 void handle_down() {
+  if (wifi_key(Key::Down)) return;
+  if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
+    s_pinDigit[s_pinPos] = wrap(s_pinDigit[s_pinPos] - 1, 10);
+    s_pinWrong = false;
+    refresh_content();
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Engineer && s_engSelected == 2) {
+    panel_adjust(-1);
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 4) {
+    panel_adjust(-1);
+    return;
+  }
   if (s_in_panel) {
     panel_move_row(1);
     return;
@@ -1309,14 +2117,43 @@ void handle_down() {
 }
 
 void handle_left() {
+  if (wifi_key(Key::Left)) return;
+  if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
+    s_pinPos = wrap(s_pinPos - 1, 4);
+    refresh_content();
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Engineer && s_engSelected == 2) {
+    panel_move_row(-1);
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 4) {
+    panel_move_row(-1);
+    return;
+  }
   if (s_in_panel) panel_adjust(-1);
 }
 
 void handle_right() {
+  if (wifi_key(Key::Right)) return;
+  if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
+    s_pinPos = wrap(s_pinPos + 1, 4);
+    refresh_content();
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Engineer && s_engSelected == 2) {
+    panel_move_row(1);
+    return;
+  }
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 4) {
+    panel_move_row(1);
+    return;
+  }
   if (s_in_panel) panel_adjust(1);
 }
 
 void handle_ok() {
+  if (wifi_key(Key::Ok)) return;
   if (s_in_panel) {
     if (s_mode == Mode::Outer && s_selected == 0) {
       // AHU control: OK sends ONLY the focused row's command - Left/Right
@@ -1324,29 +2161,37 @@ void handle_ok() {
       // panel afterward (success or failure) so other rows can still be
       // picked and sent in the same visit; Back is what leaves.
       if (s_panel_row == 0) fire_mode();
-      else if (s_panel_row == 1) fire_volume();
-      else fire_clean();
+      else fire_volume();
       return;
     }
     if (s_mode == Mode::Outer && s_selected == 1) {
-      // AHU reservation: OK only does something on the two action rows.
-      // Rows 0/1 (hour pickers) are no-ops here - navigate to the action
-      // row to actually send.
-      if (s_panel_row == 2) fire_start_reservation();
-      else if (s_panel_row == 3) fire_stop_reservation();
+      // Reservation: OK sends from either row.
+      fire_reservation();
       return;
     }
     leave_panel(true);
     return;
   }
-  if (s_mode == Mode::Outer && s_selected == 3) {
-    enter_engineer();
+  if (s_mode == Mode::Outer && s_selected == 6) {
+    if (!s_pinOpen) {
+      pin_reset();
+      s_pinOpen = true;
+      refresh_content();
+      return;
+    }
+    if (pin_matches()) {
+      enter_engineer();
+    } else {
+      s_pinWrong = true;
+      refresh_content();
+    }
     return;
   }
   enter_panel();
 }
 
 bool handle_back() {
+  if (wifi_key(Key::Back)) return true;
   if (s_in_panel) {
     // AHU control (s_selected == 0) needs no special case here anymore:
     // the generic restore_data() below correctly discards only whatever
@@ -1354,6 +2199,11 @@ bool handle_back() {
     // a sent field into s_snap the moment it's confirmed, so Back can't
     // undo a row that already reached the controller.
     leave_panel(false);
+    return true;
+  }
+  if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
+    pin_reset();
+    refresh_content();
     return true;
   }
   if (s_mode == Mode::Engineer) {

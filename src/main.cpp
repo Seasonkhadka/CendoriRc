@@ -9,21 +9,39 @@
  *   In settings: OK enters the right panel, arrows change values,
  *   OK saves, BACK cancels / leaves. See ui_settings_screen.h.
  */
-#include <Arduino.h>
-#include <Arduino_GFX_Library.h>
-#include <Wire.h>
+#include <stdio.h>
+
+#include <cmath>
+
 #include <lvgl.h>
+
+#include "driver/uart.h"
+#include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_rgb.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "io/ahu_link.h"
 #include "io/ahu_protocol.h"
 #include "io/backlight.h"
 #include "io/plc_link.h"
+#include "io/plc_protocol.h"
+#include "io/rs485_link.h"
 #include "io/sensors.h"
 #include "io/touch_buttons.h"
+#include "port/esp_time.h"
+#include "port/i2c_bus.h"
+#include "net/WifiController.h"
+#include "rc/AirIndex.h"
+#include "rc/RcController.h"
 #include "ui/ui_dashboard_chrome.h"
+#include "ui/ui_lang.h"
 #include "ui/ui_main_screen.h"
 #include "ui/ui_main_screen_v2.h"
 #include "ui/ui_settings_screen.h"
+#include "ui/ui_theme.h"
 
 /* --- CN1 / U7 net map (schematic sheet 1) ------------------------------ */
 #define PIN_BL   46   // TFT_BL  -> R11 100R -> MP3302 EN  (HIGH = backlight on)
@@ -58,25 +76,14 @@
 /* CN1.35 RESET = RC power-on (R62/C57), CN1.31 DISP = 10k pull-up,
  * CN1.39 CS / CN1.40 OTP = 10k pull-up.  None of them need a GPIO. */
 
-Arduino_ESP32RGBPanel *panel = new Arduino_ESP32RGBPanel(
-    PIN_DE, PIN_VS, PIN_HS, PIN_CLK,
-    LCD_R0, LCD_R1, LCD_R2, LCD_R3, LCD_R4,
-    LCD_G0, LCD_G1, LCD_G2, LCD_G3, LCD_G4, LCD_G5,
-    LCD_B0, LCD_B1, LCD_B2, LCD_B3, LCD_B4,
-    0 /*hsync_pol*/, 210 /*front*/, 30 /*pulse*/, 16 /*back*/,
-    0 /*vsync_pol*/,  22 /*front*/, 13 /*pulse*/, 10 /*back*/,
-    1 /*pclk_active_neg*/, 16000000 /*16 MHz DCLK*/);
-
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(800, 480, panel);
+static esp_lcd_panel_handle_t lcd = nullptr;
 
 /* --- LVGL plumbing ------------------------------------------------------ */
 static lv_disp_draw_buf_t s_draw_buf;
 static lv_disp_drv_t s_disp_drv;
 
 static void disp_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-  uint32_t w = area->x2 - area->x1 + 1;
-  uint32_t h = area->y2 - area->y1 + 1;
-  gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)color_p, w, h);
+  esp_lcd_panel_draw_bitmap(lcd, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
   lv_disp_flush_ready(drv);
 }
 
@@ -88,12 +95,29 @@ static void disp_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
  *   Back    Ok    Right   Down
  *   Up      Left  Setting Power
  */
+using ui_lang::tr;
+
 static lv_obj_t *s_dashA = nullptr;      // circular gauges
 static lv_obj_t *s_dashB = nullptr;      // trend chart
 static lv_obj_t *s_settingsScreen = nullptr;
 static int s_dashIndex = 0;              // 0 = dash A, 1 = dash B
 
+// Set after a language change: the dashboards still show the old language
+// and are rebuilt the next time one is shown.
+static bool s_dashStale = false;
+
+static void buildDashboards();
+static void logLvMem(const char *what);
+static void uiRefresh(const RcDto &rc);
+static void refreshLocalSensors();
+
 static void showDashboard() {
+  if (s_dashStale) {
+    buildDashboards();
+    uiRefresh(RcController::instance().getState());
+    refreshLocalSensors();
+    logLvMem("after dashboard rebuild");
+  }
   lv_scr_load(s_dashIndex == 0 ? s_dashA : s_dashB);
 }
 
@@ -101,63 +125,201 @@ static bool settingsIsOpen() {
   return lv_scr_act() == s_settingsScreen;
 }
 
-// Pushes the latest sensor cache into both dashboards' widgets. Both
-// s_dashA/s_dashB stay alive for the whole program (only one is ever on
-// screen, lv_scr_load() just swaps which), so it's safe and cheap to
-// update them unconditionally rather than track which one is visible.
-//
-// TVOC now uses Sensirion's official Gas Index Algorithm (sensors.cpp),
-// so it's a real calibrated index and gets pushed to the UI. CO is still
-// deliberately NOT pushed: the raw millivolt reading isn't converted to
-// ppm yet (needs the sensor cell's sensitivity spec), so it keeps showing
-// "--" rather than a number that looks real but isn't.
-static void refreshDashboard() {
-  if (sensors::hasTemp()) {
-    float tempC = sensors::getTempC();
-    int rhPct = (int)(sensors::getHumidityPct() + 0.5f);
-    Serial.printf("[SHT40] temp=%.1fC rh=%d%%\n", tempC, rhPct);
-    ui_dashboard_chrome::set_temp_humidity(tempC, rhPct);
-    ui_main_screen::set_indoor(tempC, rhPct);
-    ui_main_screen_v2::set_indoor(tempC, rhPct);
-  }
-  if (sensors::hasCo2()) {
-    Serial.printf("[SCD40] co2=%dppm\n", sensors::getCo2Ppm());
-    ui_dashboard_chrome::set_co2(sensors::getCo2Ppm());
-  }
-  if (sensors::hasVocRaw()) {
-    Serial.printf("[SGP40] voc_index=%d (raw=%u)\n", sensors::getVocIndex(), sensors::getVocRaw());
-    ui_dashboard_chrome::set_tvoc(sensors::getVocIndex());
-  }
-  if (sensors::hasCo()) {
-    Serial.printf("[CO] %dmV (uncalibrated - not shown on screen)\n", sensors::getCoMilliVolts());
-  }
-  if (sensors::hasPm()) {
-    Serial.printf("[PM2012] pm1.0=%d pm2.5=%d pm10=%d ug/m3\n", sensors::getPm1Ug(), sensors::getPm25Ug(),
-                  sensors::getPm10Ug());
-    ui_dashboard_chrome::set_pm25((float)sensors::getPm25Ug());
-    ui_dashboard_chrome::set_pm10((float)sensors::getPm10Ug());
-  }
+// Indoor AQI number 0-500 (worst sub-index) and colour from sensor-data
+// average (not from AQI). Ring fill follows the number only.
+static AQI::Result refreshAirIndex(const RC::SensorCache &cache) {
+  static const char *labelKo[] = {"-", "좋음", "보통", "나쁨", "매우 나쁨"};
+  static const char *labelEn[] = {"-", "Good", "Moderate", "Bad", "Very bad"};
+  static const uint32_t colors[] = {ui_theme::AQI_NONE, ui_theme::AQI_GOOD, ui_theme::AQI_NORMAL, ui_theme::AQI_BAD,
+                                    ui_theme::AQI_VERY_BAD};
+  const AQI::Result r = AQI::evaluate(cache);
+  const int shown = r.level == AQI::NONE ? -1 : (int)std::lround(r.aqi);
+  const char *label = tr(labelKo[r.level], labelEn[r.level]);
+  ui_main_screen::set_aqi(shown, label, colors[r.level]);
+  ui_main_screen_v2::set_aqi(shown, label, colors[r.level]);
+  return r;
+}
+
+// Pushes the RC's own sensor readings into both dashboards (both stay
+// alive, only one is on screen) and into the controller's cache for the
+// B6/B7/B8 replies. TVOC is ug/m3 and CO is ppm, the units of the ERV
+// internal protocol (B6 / B8).
+static void refreshLocalSensors() {
+  RC::SensorCache cache;
+  cache.hasTemp = sensors::hasTemp();
+  cache.tempC = sensors::getTempC();
+  cache.humidity = sensors::getHumidityPct();
+  cache.hasCo2 = sensors::hasCo2();
+  cache.co2 = cache.hasCo2 ? sensors::getCo2Ppm() : -1;
+  cache.hasVoc = sensors::hasVocRaw();
+  cache.tvoc = cache.hasVoc ? sensors::getTvocUg() : -1;
+  cache.hasPm = sensors::hasPm();
+  cache.pm25 = cache.hasPm ? sensors::getPm25Ug() : -1;
+  cache.pm10 = cache.hasPm ? sensors::getPm10Ug() : -1;
+  cache.pm1 = cache.hasPm ? sensors::getPm1Ug() : -1;
+  cache.hasCo = sensors::hasCo();
+  cache.co = cache.hasCo ? (int)std::lround(sensors::getCoPpm()) : -1;
+
+  ui_dashboard_chrome::set_temp_humidity(cache.hasTemp ? cache.tempC : -99.0f,
+                                         cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
+  ui_main_screen::set_indoor(cache.hasTemp ? cache.tempC : -99.0f,
+                            cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
+  ui_main_screen_v2::set_indoor(cache.hasTemp ? cache.tempC : -99.0f,
+                               cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
+  ui_dashboard_chrome::set_co2(cache.co2);
+  ui_dashboard_chrome::set_tvoc(cache.tvoc);
+  ui_dashboard_chrome::set_pm25((float)cache.pm25);
+  ui_dashboard_chrome::set_pm10((float)cache.pm10);
+  ui_dashboard_chrome::set_co(cache.co);
+
   if (sensors::hasRtc()) {
-    Serial.printf("[RTC] %02d:%02d:%02d %04d-%02d-%02d\n", sensors::getHour24(), sensors::getMinute(),
-                  sensors::getSecond(), sensors::getYear(), sensors::getMonth(), sensors::getDay());
-    ui_dashboard_chrome::set_time(sensors::getHour24(), sensors::getMinute());
+    ui_dashboard_chrome::set_time(sensors::getYear(), sensors::getMonth(), sensors::getDay(),
+                                  sensors::getHour24(), sensors::getMinute());
+    ui_settings_screen::set_time(sensors::getYear(), sensors::getMonth(), sensors::getDay(),
+                                 sensors::getHour24(), sensors::getMinute());
+  }
+  RcController::instance().setLocalSensors(cache);
+  const AQI::Result aqi = refreshAirIndex(cache);
+
+  static uint32_t lastPrintMs = 0;
+  uint32_t now = millis();
+  if (now - lastPrintMs >= 500) {
+    lastPrintMs = now;
+    printf("[SEN] indoor T=%.1fC RH=%.0f%% CO2=%d VOC=%d(idx %d) CO=%d(%dmV) PM2.5=%d PM10=%d aqi=%d\n",
+           cache.hasTemp ? cache.tempC : -99.0f, cache.hasTemp ? cache.humidity : -1.0f,
+           cache.hasCo2 ? cache.co2 : -1, cache.hasVoc ? cache.tvoc : -1, sensors::getVocIndex(),
+           cache.co, sensors::getCoMilliVolts(),
+           cache.hasPm ? cache.pm25 : -1, cache.hasPm ? cache.pm10 : -1,
+           aqi.level == AQI::NONE ? -1 : (int)std::lround(aqi.aqi));
   }
 }
 
-static void onButtonPress(touch::Button b) {
-  Serial.printf("btn %d\n", static_cast<int>(b));
+static const char *modeBadge(const RcDto &rc) {
+  static const char *names[RC::UI_MODE_COUNT] = {"전열교환", "바이패스", "청정", "자동", "AI 모드"};
+  static const char *namesEn[RC::UI_MODE_COUNT] = {"HEAT RECOVERY", "BYPASS", "CLEAN", "AUTO", "AI"};
+  if (!rc.isRunning()) return tr("정지", "OFF");
+  if (rc.autoActive() && rc.effectiveClean()) return tr("자동 청정", "AUTO CLEAN");
+  return tr(names[rc.uiMode()], namesEn[rc.uiMode()]);
+}
 
+// RcController data callback - UI task only.
+static void uiRefresh(const RcDto &rc) {
+  // Shown from RcDto only - the same values the next B5 carries (sleep -> low,
+  // auto -> the RC's own Table 4 result).
+  ui_main_screen::set_mode_badge(modeBadge(rc));
+  ui_main_screen_v2::set_mode_badge(modeBadge(rc));
+  const uint8_t vol = rc.effectiveVolume();
+  ui_main_screen::set_fan_level(vol);
+  ui_main_screen_v2::set_fan_level(vol);
+
+  // VSP for the active fan step (약/중/강) and current 전열/바이패스 set.
+  uint8_t supplyVsp = 0;
+  uint8_t exhaustVsp = 0;
+  if (vol >= 1 && vol <= 3) {
+    const int i = vol - 1;
+    if (rc.bypass) {
+      const uint8_t s[3] = {rc.vspBpSupplyL, rc.vspBpSupplyM, rc.vspBpSupplyH};
+      const uint8_t e[3] = {rc.vspBpExhaustL, rc.vspBpExhaustM, rc.vspBpExhaustH};
+      supplyVsp = s[i];
+      exhaustVsp = e[i];
+    } else {
+      const uint8_t s[3] = {rc.vspSupplyL, rc.vspSupplyM, rc.vspSupplyH};
+      const uint8_t e[3] = {rc.vspExhaustL, rc.vspExhaustM, rc.vspExhaustH};
+      supplyVsp = s[i];
+      exhaustVsp = e[i];
+    }
+  }
+  ui_main_screen::set_fan_vsp(supplyVsp, exhaustVsp);
+  ui_main_screen_v2::set_fan_vsp(supplyVsp, exhaustVsp);
+
+  // Old RC error codes (SHR-L2 2.7): E1 supply fan, E2 exhaust fan, E3 both.
+  const bool supErr = rc.errCode & PLC::SUPPLY_FAN_ERR;
+  const bool exhErr = rc.errCode & PLC::EXHAUST_FAN_ERR;
+  if (supErr && exhErr) ui_dashboard_chrome::set_filter_status("E3", false);
+  else if (supErr) ui_dashboard_chrome::set_filter_status("E1", false);
+  else if (exhErr) ui_dashboard_chrome::set_filter_status("E2", false);
+  else if (rc.errCode & PLC::OA_FAN_ERR) ui_dashboard_chrome::set_filter_status("FAN ERR", false);
+  else if (rc.filterReplaceDue()) // MAIN's alarm bit, or the RC's own 2,000 h count
+    ui_dashboard_chrome::set_filter_status(tr("필터 교체", "Replace filter"), false);
+  else if (rc.errCode & PLC::FILTER_CLEAN_ALARM)
+    ui_dashboard_chrome::set_filter_status(tr("필터 청소", "Clean filter"), false);
+  else ui_dashboard_chrome::set_filter_status(tr("필터 정상", "Filter OK"), true);
+
+  if (rc.rxMask & RC::RX_D5) {
+    ui_dashboard_chrome::set_weather(tr("외기", "Outdoor"), (float)rc.outdoorTemp);
+  }
+  ui_settings_screen::set_state(rc);
+}
+
+// LVGL pool use, to watch the headroom left by a rebuild.
+static void logLvMem(const char *what) {
+  lv_mem_monitor_t mon;
+  lv_mem_monitor(&mon);
+  printf("[UI] %s: LVGL pool used %u%% free %u B (largest %u B, frag %u%%)\n", what, (unsigned)mon.used_pct,
+         (unsigned)mon.free_size, (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
+}
+
+// Builds both dashboards in the current language. The old ones are deleted
+// FIRST: the LVGL pool (LV_MEM_SIZE) only fits one set of screens, so old
+// and new side by side runs it out. Must not be called while a dashboard
+// is the active screen.
+static void buildDashboards() {
+  if (s_dashA) lv_obj_del(s_dashA);
+  if (s_dashB) lv_obj_del(s_dashB);
+  ui_dashboard_chrome::reset();
+  s_dashA = lv_obj_create(NULL);
+  ui_main_screen::create(s_dashA);
+  s_dashB = lv_obj_create(NULL);
+  ui_main_screen_v2::create(s_dashB);
+  ui_dashboard_chrome::set_wifi_connected(WifiController::instance().getState().connected());
+  s_dashStale = false;
+}
+
+// WifiController data callback - UI task only.
+static void wifiRefresh(const WifiDto &wifi) {
+  ui_dashboard_chrome::set_wifi_connected(wifi.connected());
+  ui_settings_screen::set_wifi_state(wifi);
+}
+
+// Builds the settings screen in the current language. On a rebuild
+// (language change) the shown screen is swapped for an empty placeholder
+// and deleted before the new one is built (same pool limit as above).
+// Nothing is drawn in between, so the user only sees the new screen.
+static void buildSettings() {
+  lv_obj_t *placeholder = nullptr;
+  if (s_settingsScreen) {
+    placeholder = lv_obj_create(NULL);
+    lv_scr_load(placeholder);
+    lv_obj_del(s_settingsScreen);
+  }
+  s_settingsScreen = ui_settings_screen::create();
+  ui_settings_screen::set_wifi_state(WifiController::instance().getState());
+  if (placeholder) {
+    lv_scr_load(s_settingsScreen);
+    lv_obj_del(placeholder);
+  }
+}
+
+// Language change: only the settings screen (on screen now) is rebuilt
+// here, so the switch is one quick redraw. The dashboards follow when the
+// user leaves settings.
+static void onLanguageChanged() {
+  const uint32_t t0 = millis();
+  buildSettings();
+  s_dashStale = true;
+  ui_settings_screen::set_state(RcController::instance().getState());
+  refreshLocalSensors();
+  printf("[UI] settings rebuilt in %u ms\n", (unsigned)(millis() - t0));
+  logLvMem("after settings rebuild");
+}
+
+static void onButtonPress(touch::Button b) {
   // Power toggles the LCD and sends the matching AHU command (any screen).
   if (b == touch::Button::Power) {
-    if (millis() < 2000) {
-      Serial.println("[AHU] ignore Power during boot");
-      return;
-    }
-    const bool on = !backlight::isOn();
-    backlight::set(on);
-    Serial.printf("[AHU] RC power %s\n", on ? "on" : "off");
-    const bool ok = on ? ahu_protocol::power_on() : ahu_protocol::power_off();
-    Serial.printf("[AHU] power %s %s\n", on ? "on" : "off", ok ? "ok" : "failed");
+    if (millis() < 2000) return;
+    const RcDto rc = RcController::instance().getState();
+    const bool running = rc.isRunning();
+    if (RcController::instance().setPowerState(!running)) backlight::set(!running);
     return;
   }
 
@@ -180,6 +342,7 @@ static void onButtonPress(touch::Button b) {
         break;
       case touch::Button::Ok:
         ui_settings_screen::handle_ok();
+        if (ui_settings_screen::take_language_changed()) onLanguageChanged();
         break;
       default:
         break;
@@ -206,10 +369,24 @@ static void onButtonPress(touch::Button b) {
 }
 
 // D5 status poll for this PCB (id 0x64). Ignore IoT/other station frames.
-constexpr bool kAhuIdTestEnabled = true;
+constexpr bool kAhuIdTestEnabled = false;
 // Real id is 0x62, not 0x64 - the id echoed in prior replies was never
 // proof of the unit's real address, it just mirrored whatever id we sent.
 constexpr uint8_t kAhuTestId = 0x62;
+
+// One-shot diagnostic: does MAIN react AT ALL to a single, isolated, clean
+// B5 transmit - independent of whether we ever successfully decode a D5/E5
+// first? plc_protocol::sendDiagnosticProbeOnce() sends exactly one valid B5
+// frame through the real GPIO19/Q5 path, then it's done - never looped.
+// Reset check: logResetReason() already runs first thing in app_main() on
+// EVERY boot, so if this TX browns out the board, the very next thing in
+// the capture will be a fresh "[BOOT] reset_reason=BROWNOUT" line - no
+// extra detection code needed, just watch for that line right after the
+// "[PLC] DIAG probe" line.
+// Already did its job this session (confirmed TX path is electrically
+// clean and safe, no brownout) - off now so it doesn't interleave with the
+// real decode+reply path below and confuse the capture.
+constexpr bool kPlcDiagProbeEnabled = false;
 
 // TEMPORARY diagnostic: listen on the RS-485 bus for durationMs WITHOUT
 // transmitting anything, to check whether the "B5 00 64 00 00 1E 00 00 00
@@ -219,25 +396,12 @@ constexpr uint8_t kAhuTestId = 0x62;
 // on their own cadence with nothing transmitted, every "response" logged
 // by test_ahu_status_poll()/power_on() so far was never a reply at all.
 static void test_ahu_passive_listen(uint32_t durationMs) {
-  Serial.printf("[PASSIVE] listening %lums, no TX - watching for unsolicited traffic\n",
-                (unsigned long)durationMs);
-  while (Serial1.available()) Serial1.read(); // start from empty
-
+  uart_flush_input(UART_NUM_1);
   uint32_t start = millis();
-  uint32_t lastByteAt = start;
-  bool any = false;
   while (millis() - start < durationMs) {
-    if (Serial1.available()) {
-      uint32_t now = millis();
-      if (any && now - lastByteAt > 50) Serial.println(); // gap = new frame
-      if (!any || now - lastByteAt > 50) Serial.printf("[PASSIVE] t=%lums:", (unsigned long)(now - start));
-      Serial.printf(" %02X", Serial1.read());
-      lastByteAt = now;
-      any = true;
-    }
+    uint8_t b;
+    (void)uart_read_bytes(UART_NUM_1, &b, 1, 0);
   }
-  if (any) Serial.println();
-  else Serial.println("[PASSIVE] nothing received - bus is silent without our TX");
 }
 
 static void test_ahu_status_poll() {
@@ -248,43 +412,80 @@ static void test_ahu_status_poll() {
   for (int i = 0; i < 9; i++) parity ^= frame[i];
   frame[9] = parity;
 
-  Serial.printf("[D5 POLL] id=0x%02X  TX D5 00 %02X ... parity=%02X\n",
-                kAhuTestId, kAhuTestId, frame[9]);
   for (int n = 1; n <= 3; n++) {
     uint8_t resp[16] = {0};
-    size_t got = ahu_link::transact(frame, sizeof(frame), resp, sizeof(resp));
-    if (got == 0) {
-      Serial.printf("[D5 POLL] #%d no response\n", n);
-    } else {
-      Serial.printf("[D5 POLL] #%d got %u bytes:", n, (unsigned)got);
-      for (size_t i = 0; i < got; i++) Serial.printf(" %02X", resp[i]);
-      Serial.println();
-    }
+    (void)ahu_link::transact(frame, sizeof(frame), resp, sizeof(resp));
     delay(500);
   }
 }
 
-void setup() {
+static void appSetup() {
   // Q5 first: USB-JTAG on GPIO19 would otherwise load PLC+ and kill 5V
   // before the panel ever comes up. Then a dim backlight so a PLC-only
   // boot is visible even if RGB init is slow.
   plc_link::holdQ5Off();
   backlight::init(PIN_BL);
+  backlight::setBrightness(50);
 
-  Serial.begin(115200);
-  Serial.println("[power] GPIO19 LOW (Q5 off), backlight on");
+  printf("[power] GPIO19 LOW (Q5 off), backlight on\n");
 
   // Shared I2C bus - started once here, not per-module (touch_buttons.cpp
   // and sensors.cpp both just assume it's already running).
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  Wire.setClock(100000);
+  i2c_bus::begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
 
-  if (!gfx->begin()) {
-    Serial.println("RGB panel init FAILED");
+  esp_lcd_rgb_panel_config_t panel_config = {};
+  panel_config.clk_src = LCD_CLK_SRC_DEFAULT;
+  panel_config.timings.pclk_hz = 16000000; // 16 MHz DCLK
+  panel_config.timings.h_res = 800;
+  panel_config.timings.v_res = 480;
+  panel_config.timings.hsync_pulse_width = 30;
+  panel_config.timings.hsync_back_porch = 16;
+  panel_config.timings.hsync_front_porch = 210;
+  panel_config.timings.vsync_pulse_width = 13;
+  panel_config.timings.vsync_back_porch = 10;
+  panel_config.timings.vsync_front_porch = 22;
+  panel_config.timings.flags.pclk_active_neg = 1;
+  panel_config.data_width = 16;
+  panel_config.in_color_format = LCD_COLOR_FMT_RGB565;
+  panel_config.num_fbs = 1;
+  // The LCD peripheral DMAs pixels straight out of the frame buffer every
+  // PCLK; with the fb in PSRAM, anything else contending for the PSRAM bus
+  // (our own LVGL draw-buffer copies, I2C/UART ISRs, flash reads) can
+  // starve that DMA and show up as tearing/glitching ("buffering"). A
+  // bounce buffer in fast internal SRAM absorbs that - the DMA reads from
+  // it instead of PSRAM directly. 10 lines is the usual starting point in
+  // Espressif's own RGB+PSRAM examples.
+  panel_config.bounce_buffer_size_px = 800 * 10;
+  panel_config.dma_burst_size = 64;
+  panel_config.hsync_gpio_num = (gpio_num_t)PIN_HS;
+  panel_config.vsync_gpio_num = (gpio_num_t)PIN_VS;
+  panel_config.de_gpio_num = (gpio_num_t)PIN_DE;
+  panel_config.pclk_gpio_num = (gpio_num_t)PIN_CLK;
+  panel_config.disp_gpio_num = (gpio_num_t)-1;
+  // LSB-first: bit0..4=B, bit5..10=G, bit11..15=R (RGB565 wire order).
+  panel_config.data_gpio_nums[0] = (gpio_num_t)LCD_B0;
+  panel_config.data_gpio_nums[1] = (gpio_num_t)LCD_B1;
+  panel_config.data_gpio_nums[2] = (gpio_num_t)LCD_B2;
+  panel_config.data_gpio_nums[3] = (gpio_num_t)LCD_B3;
+  panel_config.data_gpio_nums[4] = (gpio_num_t)LCD_B4;
+  panel_config.data_gpio_nums[5] = (gpio_num_t)LCD_G0;
+  panel_config.data_gpio_nums[6] = (gpio_num_t)LCD_G1;
+  panel_config.data_gpio_nums[7] = (gpio_num_t)LCD_G2;
+  panel_config.data_gpio_nums[8] = (gpio_num_t)LCD_G3;
+  panel_config.data_gpio_nums[9] = (gpio_num_t)LCD_G4;
+  panel_config.data_gpio_nums[10] = (gpio_num_t)LCD_G5;
+  panel_config.data_gpio_nums[11] = (gpio_num_t)LCD_R0;
+  panel_config.data_gpio_nums[12] = (gpio_num_t)LCD_R1;
+  panel_config.data_gpio_nums[13] = (gpio_num_t)LCD_R2;
+  panel_config.data_gpio_nums[14] = (gpio_num_t)LCD_R3;
+  panel_config.data_gpio_nums[15] = (gpio_num_t)LCD_R4;
+  panel_config.flags.fb_in_psram = 1;
+
+  if (esp_lcd_new_rgb_panel(&panel_config, &lcd) != ESP_OK ||
+      esp_lcd_panel_reset(lcd) != ESP_OK ||
+      esp_lcd_panel_init(lcd) != ESP_OK) {
     return;
   }
-  Serial.printf("RGB panel OK: %dx%d\n", gfx->width(), gfx->height());
-  gfx->fillScreen(BLACK);
 
   lv_init();
 
@@ -292,28 +493,26 @@ void setup() {
   // not optional here - esp_lcd_new_rgb_panel's own full frame buffer
   // (~750KB) requires it regardless of what these are backed by.
   const uint32_t buf_lines = 40;
-  const size_t buf_px = (size_t)gfx->width() * buf_lines;
+  const size_t buf_px = (size_t)800 * buf_lines;
   lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_px * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
   lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_px * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
   if (!buf1 || !buf2) {
-    Serial.println("LVGL draw buffer allocation FAILED");
     return;
   }
   lv_disp_draw_buf_init(&s_draw_buf, buf1, buf2, buf_px);
 
   lv_disp_drv_init(&s_disp_drv);
-  s_disp_drv.hor_res = gfx->width();
-  s_disp_drv.ver_res = gfx->height();
+  s_disp_drv.hor_res = 800;
+  s_disp_drv.ver_res = 480;
   s_disp_drv.flush_cb = disp_flush_cb;
   s_disp_drv.draw_buf = &s_draw_buf;
   lv_disp_drv_register(&s_disp_drv);
 
-  s_dashA = lv_obj_create(NULL);
-  ui_main_screen::create(s_dashA);
-  s_dashB = lv_obj_create(NULL);
-  ui_main_screen_v2::create(s_dashB);
-  s_settingsScreen = ui_settings_screen::create();
+  ui_lang::load();
+  buildDashboards();
+  buildSettings();
   showDashboard();
+  logLvMem("boot");
 
   for (int i = 0; i < 5; i++) {
     lv_timer_handler();
@@ -324,11 +523,23 @@ void setup() {
   touch::onPress(onButtonPress);
 
   sensors::init(PIN_CO_ADC);
-  ahu_protocol::init();
+
+  // Settings must be loaded before the first reply to MAIN.
+  RcController::instance().init();
+  RcController::instance().setDataCallback(uiRefresh);
   plc_link::init();
+  plc_protocol::init();
+
+  // RS-485 to the monitoring PC (we answer as MAIN). Uses UART1 / GPIO17,18,48,
+  // which the old ahu_link master code used - that one is no longer started.
+  rs485_link::init();
+
+  // After NVS (RcController::init). Connects to the saved network, if any.
+  WifiController::instance().setDataCallback(wifiRefresh);
+  WifiController::instance().init();
 }
 
-void loop() {
+static void appLoop() {
   // D5 poll after the serial monitor is usually open.
   if (kAhuIdTestEnabled) {
     static bool s_passiveListenDone = false;
@@ -344,31 +555,87 @@ void loop() {
     }
   }
 
-  // Heartbeat: proves whether ANYTHING is reaching the PC over Serial at
-  // all, independent of sensors/boot timing. If this never shows up in
-  // the monitor either, the problem is below the application - the COM
-  // port isn't actually connected to this chip's Serial output.
-  static uint32_t s_lastHeartbeat = 0;
-  if (millis() - s_lastHeartbeat >= 1000) {
-    s_lastHeartbeat = millis();
-    Serial.printf("[alive] uptime=%lus\n", millis() / 1000);
+  if (kPlcDiagProbeEnabled) {
+    static bool s_diagDone = false;
+    if (!s_diagDone && millis() >= 5000) {
+      s_diagDone = true;
+      plc_protocol::sendDiagnosticProbeOnce();
+    }
+  }
+
+  // Protocol provider's RX idle-state check, second sample: same read as
+  // plc_link::init()'s boot-time log, but taken once the PLC bus has had
+  // time to settle (10s in), to see whether the idle level differs from
+  // the immediate post-boot reading.
+  {
+    static bool s_rxIdleLateDone = false;
+    if (!s_rxIdleLateDone && millis() >= 10000) {
+      s_rxIdleLateDone = true;
+      printf("[PLC] RX pin idle state (later-boot, t=%ums): %d\n", (unsigned)millis(),
+             plc_link::rxPinLevel());
+    }
   }
 
   touch::poll();
-  plc_link::poll();
+
+  // Old RC 3.4: hold Up + Down for 3 s on the dashboard toggles heater use.
+  {
+    static uint32_t s_comboStartMs = 0;
+    static bool s_comboFired = false;
+    const bool held = !settingsIsOpen() && touch::isPressed(touch::Button::Up) &&
+                      touch::isPressed(touch::Button::Down);
+    if (!held) {
+      s_comboStartMs = 0;
+      s_comboFired = false;
+    } else if (s_comboStartMs == 0) {
+      s_comboStartMs = millis();
+    } else if (!s_comboFired && millis() - s_comboStartMs >= 3000) {
+      s_comboFired = true;
+      const bool on = !RcController::instance().getState().heater;
+      RcController::instance().setFunctionState("heater", on);
+      printf("[KEY] Up+Down 3s -> heater %s\n", on ? "ON" : "OFF");
+    }
+  }
+  plc_protocol::poll();
   backlight::tick();
 
-  static bool s_plcWasConnected = false;
-  const bool plcConnected = plc_link::isConnected();
-  if (plcConnected != s_plcWasConnected) {
-    s_plcWasConnected = plcConnected;
-    Serial.printf("[PLC] link %s\n", plcConnected ? "detected" : "lost");
-    // TODO: audible indicator here once there's a confirmed buzzer pin -
-    // no piezo/speaker is in the known pin map (main.cpp:29-56), so this
-    // can't be wired up without the actual GPIO it's wired to.
-  }
-
-  if (sensors::poll()) refreshDashboard();
+  if (sensors::poll()) refreshLocalSensors();
+  RcController::instance().uiTick();
+  WifiController::instance().uiTick();
   lv_timer_handler();
   delay(5);
+}
+
+static void appTask(void *) {
+  appSetup();
+  for (;;) appLoop();
+}
+
+// Prints why this boot happened - specifically so an unthrottled B5 TX
+// burst (GPIO19/Q5 switching onto the PLC+ rail every ~450ms) can be told
+// apart from a normal reset if the board ever brownouts during testing.
+static void logResetReason() {
+  esp_reset_reason_t r = esp_reset_reason();
+  const char *name = "UNKNOWN";
+  switch (r) {
+    case ESP_RST_POWERON: name = "POWERON"; break;
+    case ESP_RST_EXT: name = "EXT"; break;
+    case ESP_RST_SW: name = "SW"; break;
+    case ESP_RST_PANIC: name = "PANIC"; break;
+    case ESP_RST_INT_WDT: name = "INT_WDT"; break;
+    case ESP_RST_TASK_WDT: name = "TASK_WDT"; break;
+    case ESP_RST_WDT: name = "WDT"; break;
+    case ESP_RST_DEEPSLEEP: name = "DEEPSLEEP"; break;
+    case ESP_RST_BROWNOUT: name = "BROWNOUT"; break;
+    case ESP_RST_SDIO: name = "SDIO"; break;
+    default: break;
+  }
+  printf("[BOOT] reset_reason=%s (%d)\n", name, (int)r);
+}
+
+extern "C" void app_main() {
+  logResetReason();
+  // LVGL + the sensor/protocol polling loop is stack-heavier than the
+  // default main task budget - run it on its own task with real headroom.
+  xTaskCreatePinnedToCore(appTask, "app", 16384, nullptr, 5, nullptr, 1);
 }

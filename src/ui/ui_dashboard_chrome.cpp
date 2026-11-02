@@ -2,10 +2,12 @@
 #include "ui_theme.h"
 #include "ui_icons.h"
 #include "fonts/ui_fonts.h"
+#include "ui_lang.h"
 
 #include <stdio.h>
 
 using namespace ui_theme;
+using ui_lang::tr;
 
 namespace ui_dashboard_chrome {
 
@@ -21,7 +23,7 @@ namespace {
 // arrays - one slot per design - so every setter below updates all of them.
 constexpr int kMaxInstances = 2;
 
-lv_obj_t *s_mode_label[kMaxInstances] = {};
+lv_obj_t *s_wifi_label[kMaxInstances] = {};
 lv_obj_t *s_wifi_icon[kMaxInstances] = {};
 lv_obj_t *s_weather_label[kMaxInstances] = {};
 lv_obj_t *s_time_label[kMaxInstances] = {};
@@ -78,6 +80,7 @@ lv_obj_t *build_stat_card(lv_obj_t *parent, lv_obj_t *(*icon_fn)(lv_obj_t *, lv_
   lv_obj_set_style_clip_corner(card, true, 0);
   lv_obj_set_style_border_width(card, 1, 0);
   lv_obj_set_style_border_color(card, c(BORDER), 0);
+  elevate(card);
   lv_obj_set_style_pad_all(card, 6, 0);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -112,6 +115,11 @@ lv_obj_t *build_stat_card(lv_obj_t *parent, lv_obj_t *(*icon_fn)(lv_obj_t *, lv_
 
 } // namespace
 
+void reset() {
+  s_topBarCount = 0;
+  s_bottomBarCount = 0;
+}
+
 lv_obj_t *build_top_bar(lv_obj_t *parent) {
   int idx = (s_topBarCount < kMaxInstances) ? s_topBarCount++ : kMaxInstances - 1;
 
@@ -122,27 +130,26 @@ lv_obj_t *build_top_bar(lv_obj_t *parent) {
   lv_obj_set_style_radius(bar, 14, 0);
   lv_obj_set_style_border_width(bar, 1, 0);
   lv_obj_set_style_border_color(bar, c(BORDER), 0);
+  elevate(bar);
   lv_obj_set_style_pad_hor(bar, 18, 0);
   lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  // Wi-Fi / operating mode
+  // Wi-Fi state
   lv_obj_t *g1 = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 6);
   s_wifi_icon[idx] = ui_icons::wifi(g1, 20, c(TEXT_PRIMARY));
-  s_mode_label[idx] = make_label(g1, "전열모드", &ui_font_sm, TEXT_PRIMARY);
+  s_wifi_label[idx] = make_label(g1, tr("미연결", "Not connected"), &ui_font_sm, TEXT_SECONDARY);
 
   // Weather
   lv_obj_t *g2 = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 6);
   ui_icons::sun(g2, 20, c(WARN));
-  s_weather_label[idx] = make_label(g2, "맑음 22°C", &ui_font_sm, TEXT_SECONDARY);
+  s_weather_label[idx] = make_label(g2, "--", &ui_font_sm, TEXT_SECONDARY);
 
-  // Clock
-  lv_obj_t *g3 = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 6);
-  ui_icons::clock(g3, 18, c(TEXT_SECONDARY));
-  s_time_label[idx] = make_label(g3, "PM 02:30", &ui_font_sm, TEXT_SECONDARY);
+  // Clock (date + time text only — no icon)
+  s_time_label[idx] = make_label(bar, "--", &ui_font_sm, TEXT_SECONDARY);
 
   // Filter status
-  s_filter_label[idx] = make_label(bar, "필터 정상", &ui_font_sm, GOOD);
+  s_filter_label[idx] = make_label(bar, tr("필터 정상", "Filter OK"), &ui_font_sm, GOOD);
 
   return bar;
 }
@@ -152,17 +159,12 @@ lv_obj_t *build_bottom_bar(lv_obj_t *parent) {
 
   lv_obj_t *bar = make_row(parent, LV_PCT(100), 110, 8);
 
-  // PM2.5/PM10/TVOC/CO show "--" until a real, calibrated reading is wired
-  // in (see sensors.cpp) - a dash is honest about "no data yet"; a static
-  // placeholder number like "12" or "0.08" looks like a live reading and
-  // isn't. CO2 and Temp/Humidity are genuinely live (SCD40/SHT40), so they
-  // keep real starting values.
-  build_stat_card(bar, ui_icons::dust, "PM2.5:", "--", "ug/m3", &s_pm25_val[idx]);
-  build_stat_card(bar, ui_icons::dust, "PM10:", "--", "ug/m3", &s_pm10_val[idx]);
-  build_stat_card(bar, ui_icons::cloud, "CO2:", "560", "ppm", &s_co2_val[idx]);
-  build_stat_card(bar, nullptr, "TVOC:", "--", "", &s_tvoc_val[idx]);
+  build_stat_card(bar, ui_icons::dust, "PM2.5:", "--", "µg/m³", &s_pm25_val[idx]);
+  build_stat_card(bar, ui_icons::dust, "PM10:", "--", "µg/m³", &s_pm10_val[idx]);
+  build_stat_card(bar, ui_icons::cloud, "CO₂:", "--", "ppm", &s_co2_val[idx]);
+  build_stat_card(bar, nullptr, "TVOC:", "--", "µg/m³", &s_tvoc_val[idx]);
   build_stat_card(bar, ui_icons::gasring, "CO:", "--", "ppm", &s_co_val[idx]);
-  build_stat_card(bar, ui_icons::thermo, "Temp:", "24.5°C", "48%", &s_temp_val[idx], &s_hum_val[idx], true);
+  build_stat_card(bar, ui_icons::thermo, "Temp:", "--", "--", &s_temp_val[idx], &s_hum_val[idx], true);
 
   return bar;
 }
@@ -175,12 +177,10 @@ lv_obj_t *build_bottom_bar(lv_obj_t *parent) {
 void set_wifi_connected(bool connected) {
   for (int i = 0; i < s_topBarCount; i++) {
     if (s_wifi_icon[i]) lv_obj_set_style_opa(s_wifi_icon[i], connected ? LV_OPA_COVER : LV_OPA_40, 0);
-  }
-}
-
-void set_mode_text(const char *text) {
-  for (int i = 0; i < s_topBarCount; i++) {
-    if (s_mode_label[i]) lv_label_set_text(s_mode_label[i], text);
+    if (s_wifi_label[i]) {
+      lv_label_set_text(s_wifi_label[i], connected ? tr("연결됨", "Connected") : tr("미연결", "Not connected"));
+      lv_obj_set_style_text_color(s_wifi_label[i], c(connected ? TEXT_PRIMARY : TEXT_SECONDARY), 0);
+    }
   }
 }
 
@@ -192,12 +192,12 @@ void set_weather(const char *summary, float outdoor_c) {
   }
 }
 
-void set_time(int hour24, int minute) {
+void set_time(int year, int month, int day, int hour24, int minute) {
   const char *ampm = (hour24 < 12) ? "AM" : "PM";
   int hour12 = hour24 % 12;
   if (hour12 == 0) hour12 = 12;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%s %02d:%02d", ampm, hour12, minute);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d/%02d/%02d %s %02d:%02d", year, month, day, ampm, hour12, minute);
   for (int i = 0; i < s_topBarCount; i++) {
     if (s_time_label[i]) lv_label_set_text(s_time_label[i], buf);
   }
@@ -235,17 +235,19 @@ void set_co2(int ppm) {
   }
 }
 
-void set_tvoc(int voc_index) {
+void set_tvoc(int ug) {
   char buf[12];
-  snprintf(buf, sizeof(buf), "%d", voc_index);
+  if (ug < 0) snprintf(buf, sizeof(buf), "--");
+  else snprintf(buf, sizeof(buf), "%d", ug);
   for (int i = 0; i < s_bottomBarCount; i++) {
     if (s_tvoc_val[i]) lv_label_set_text(s_tvoc_val[i], buf);
   }
 }
 
-void set_co(float ppm) {
+void set_co(int ppm) {
   char buf[12];
-  snprintf(buf, sizeof(buf), "%.1f", ppm);
+  if (ppm < 0) snprintf(buf, sizeof(buf), "--");
+  else snprintf(buf, sizeof(buf), "%d", ppm);
   for (int i = 0; i < s_bottomBarCount; i++) {
     if (s_co_val[i]) lv_label_set_text(s_co_val[i], buf);
   }

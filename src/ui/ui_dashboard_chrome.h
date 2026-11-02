@@ -18,19 +18,22 @@ namespace ui_dashboard_chrome {
 lv_obj_t *build_top_bar(lv_obj_t *parent);
 lv_obj_t *build_bottom_bar(lv_obj_t *parent);
 
+// Forgets the built bars, before both dashboards are rebuilt (language
+// change). The old screens must be deleted by the caller.
+void reset();
+
 // --- Top status bar ---
-void set_wifi_connected(bool connected);
-void set_mode_text(const char *text);                     // e.g. "전열모드"
+void set_wifi_connected(bool connected);                  // icon + "연결됨" / "미연결"
 void set_weather(const char *summary, float outdoor_c);    // e.g. "맑음", 22.0f
-void set_time(int hour24, int minute);                     // renders as "PM 02:30"
+void set_time(int year, int month, int day, int hour24, int minute); // "2026/10/27 PM 02:30"
 void set_filter_status(const char *text, bool ok);         // e.g. "필터 정상"
 
 // --- Bottom sensor strip ---
 void set_pm25(float ug_m3);
 void set_pm10(float ug_m3);
 void set_co2(int ppm);
-void set_tvoc(int voc_index); // Sensirion VOC Index, 0-500 (100 = normal baseline)
-void set_co(float ppm);
+void set_tvoc(int ug); // TVOC ug/m3, < 0 = "--"
+void set_co(int ppm);  // CO ppm, < 0 = "--"
 void set_temp_humidity(float temp_c, int humidity_pct);
 
 } // namespace ui_dashboard_chrome

@@ -5,7 +5,7 @@
  * these are standard parts, not reverse-engineered like the touch IC):
  *   SHT40   0x44  temperature / humidity
  *   SGP40   0x59  VOC raw signal (no calibrated index yet - see note below)
- *   SCD40   0x64  CO2 (ppm, direct from the sensor)
+ *   SCD40   0x62  CO2 (ppm, direct from the sensor) - auto-detected, 0x64 also tried
  *   MCP7940 0x6F  RTC (BCD registers, no CRC)
  *   PM2012  0x28  PM1.0/PM2.5/PM10 (ug/m3, direct from the sensor) - was
  *                 gated off until a real I2C scan confirmed 0x28 ACKs (pin
@@ -26,7 +26,8 @@
  */
 #pragma once
 
-#include <Arduino.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 namespace sensors {
 
@@ -44,9 +45,13 @@ int getCo2Ppm();
 
 bool hasVocRaw();
 uint16_t getVocRaw(); // raw SGP40 signal ticks - NOT a calibrated index
-int getVocIndex();    // Sensirion VOC Index, 0-500 (100 = normal baseline) - valid whenever hasVocRaw() is
+int getVocIndex();    // Sensirion VOC Index, 1-500 (100 = normal baseline) - valid whenever hasVocRaw() is
+int getTvocUg();      // TVOC ug/m3 converted from the VOC Index (protocol B6 / D9 unit)
 
 bool hasRtc();
+// Sets the MCP7940 RTC (24-hour, local time) and re-reads it. Call from the
+// same task as poll() (I2C bus). Returns false if the RTC does not answer.
+bool setRtcTime(int year, int month, int day, int hour, int minute, int second);
 int getHour24();
 int getMinute();
 int getSecond();
@@ -55,7 +60,8 @@ int getMonth();
 int getYear();
 
 bool hasCo();
-int getCoMilliVolts(); // raw ADC reading - not yet converted to ppm
+int getCoMilliVolts(); // filtered SEN_VOUT millivolts (log / calibration)
+float getCoPpm();      // ME2-CO ppm - valid after the warm-up (hasCo())
 
 bool hasPm(); // false until kPm2012HardwareReady is flipped on in sensors.cpp
 int getPm1Ug();

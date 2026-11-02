@@ -1,5 +1,7 @@
 #include "touch_buttons.h"
-#include <Wire.h>
+
+#include "port/esp_time.h"
+#include "port/i2c_bus.h"
 
 namespace touch {
 
@@ -21,18 +23,16 @@ constexpr uint8_t kTouchAddr = 0x24;
 constexpr uint8_t kOutputDataReg = 0x2A;
 
 uint8_t read_raw_mask() {
-  Wire.beginTransmission(kTouchAddr);
-  Wire.write(kOutputDataReg);
-  if (Wire.endTransmission(false) != 0) return 0x00; // bus error -> nothing pressed
-  Wire.requestFrom((int)kTouchAddr, 1, (int)true);
-  if (Wire.available()) return Wire.read();
-  return 0x00;
+  uint8_t reg = kOutputDataReg;
+  uint8_t val = 0x00;
+  if (i2c_bus::writeThenRead(kTouchAddr, &reg, 1, &val, 1) != 1) return 0x00; // bus error -> nothing pressed
+  return val;
 }
 
 } // namespace
 
 void init() {
-  // Wire.begin() happens once in main.cpp - this is the same shared
+  // i2c_bus::begin() happens once in main.cpp - this is the same shared
   // sensor bus (SDA=40/SCL=41) that sensors.cpp also uses.
 }
 

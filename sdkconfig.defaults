@@ -1,0 +1,51 @@
+# Octal PSRAM (ESP32-S3-WROOM-1-N8R8). Mandatory: esp_lcd_new_rgb_panel's
+# own frame buffer (~750KB) requires it - confirmed on real hardware that
+# the display cannot work without it.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+
+# Matches the ~1ms timing granularity most of this codebase's millis()-based
+# intervals (debounce, rate limits) assume.
+CONFIG_FREERTOS_HZ=1000
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Board actually has 8MB flash (confirmed earlier: esptool chip info showed
+# "Embedded PSRAM 8MB" on this exact module) - the generic devkitc-1 board
+# default PlatformIO picked up was 2MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# GCC 15 / Windows: -O2 ICEs in esp_lcd_panel_rgb.c. Size opt is the
+# documented workaround and is fine for this firmware.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# GPIO19/20 are PLC-TX/RX (Q5/Q3), not USB. USB-Serial-JTAG on those
+# pads turns Q5 on and kills PLC 5V. Console stays UART0 (ESP-PROG COM4).
+# CONFIG_USJ_ENABLE_USB_SERIAL_JTAG is not set
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Flash writes (NVS saves: settings, language) disable the flash cache.
+# With code/rodata still in flash, the RGB panel's bounce-buffer ISR and
+# the PSRAM frame buffer stall during that time and the picture shifts or
+# flickers. Running code and rodata from PSRAM plus an IRAM-safe LCD ISR is
+# Espressif's documented fix; RESTART_IN_VSYNC recovers from any drift.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+
+# Wi-Fi: custom partition table (3 MB app, see partitions.csv) and Wi-Fi /
+# lwIP buffers in PSRAM so they don't eat the internal RAM the LVGL pool and
+# the LCD bounce buffers need.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
