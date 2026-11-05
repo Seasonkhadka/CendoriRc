@@ -110,6 +110,7 @@ struct Cache {
 
   uint16_t vocRaw = 0;
   int vocIndex = 0;  // 0 during the algorithm's ~45 s start-up blackout
+  int tvocPpb = 0;
   int tvocUg = 0;
   bool vocValid = false;
 
@@ -169,12 +170,17 @@ bool readSHT40() {
 // Without it the raw signal moves with room humidity, which the VOC
 // Index then reports as VOC changes.
 
-int tvocFromIndex(int index) {
+int tvocPpbFromIndex(int index) {
   if (index <= 0) return 0;
   if (index > 500) index = 500;
   float ppb = (logf(501.0f - (float)index) - SEN_TVOC_LN_OFFSET) * SEN_TVOC_PPB_SCALE;
   if (ppb < 0) ppb = 0;
-  long ug = lroundf(ppb * SEN_TVOC_UG_PER_PPB);
+  long v = lroundf(ppb);
+  return v > 65535 ? 65535 : (int)v;
+}
+
+int tvocUgFromPpb(int ppb) {
+  long ug = lroundf((float)ppb * SEN_TVOC_UG_PER_PPB);
   return ug > SEN_TVOC_MAX_UG ? SEN_TVOC_MAX_UG : (int)ug;
 }
 
@@ -207,7 +213,8 @@ bool readSGP40() {
   // The algorithm returns 0 until its start-up blackout ends - show "--"
   // instead of a fake 0 followed by a jump.
   if (s_cache.vocIndex <= 0) return false;
-  s_cache.tvocUg = tvocFromIndex(s_cache.vocIndex);
+  s_cache.tvocPpb = tvocPpbFromIndex(s_cache.vocIndex);
+  s_cache.tvocUg = tvocUgFromPpb(s_cache.tvocPpb);
   s_cache.vocValid = true;
   return true;
 }
@@ -629,6 +636,7 @@ bool hasVocRaw() { return s_cache.vocValid; }
 uint16_t getVocRaw() { return s_cache.vocRaw; }
 int getVocIndex() { return s_cache.vocIndex; }
 int getTvocUg() { return s_cache.tvocUg; }
+int getTvocPpb() { return s_cache.tvocPpb; }
 
 bool hasRtc() { return s_cache.rtcValid; }
 

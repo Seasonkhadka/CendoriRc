@@ -140,6 +140,30 @@ Reply priority after **D5**:
 
 After **E5**: always a normal B5 reporting the state *after* the E5 was applied.
 
+### 4.4 Pressure modes (양압 / 음압, RC only)
+
+MAIN has one shared fan speed, so the RC builds the supply / exhaust
+difference itself (`src/rc/RcPressure.*`):
+
+* Two air paths: 전열 (`UI_POSITIVE` / `UI_NEGATIVE`, bypass bit off) and
+  바이패스 (`UI_BP_POSITIVE` / `UI_BP_NEGATIVE`, bypass bit on). Clean and auto
+  bits are off. Fan level 1 = setpoint, 2 = CO2 boost
+  (`RcDto::effectiveVolume()`).
+* On entering the mode, changing its setpoints, or booting in it, the RC
+  queues that path's two **C5** frames (전열 1/2 or 바이패스 3/4, exhaust then
+  supply) with the pressure table: L = setpoint, M = H = boost
+  (`RcDto::pressureVspTable()`).
+* On leaving it (other mode, 급기/배기 단독, or an E5/E7 that sets clean / auto /
+  single fan), or on switching path, the RC queues the old path's C5 frames
+  with the normal table again.
+* `m_vspSkew` (NVS flags `FB2_VSP_SKEWED` / `FB2_VSP_SKEWED_BP`) records which
+  set on MAIN holds the pressure table. After a power loss in another mode,
+  boot restores the normal table.
+* While a set is skewed, A6 frames for that set are ignored
+  (`RC_PRESS_IGNORE_A6_WHILE_SKEWED`), so MAIN echoing the pressure table
+  cannot overwrite the RC's normal table. Engineer VSP edits to that set are
+  stored, and sent when the mode is left.
+
 ---
 
 ## 5. Threading and timing
@@ -297,7 +321,11 @@ units (the PLC value itself). NVS blob version 3.
 
 ## 8. Persistence (NVS)
 
-* Namespace `rc`, key `settings`, blob version **2**.
+* Namespace `rc`, key `settings`, blob version **3**. `flags2` also holds 양압
+  / 음압 and the "MAIN has the pressure VSP table" flag (old blobs read as 0).
+* Key `press` (version 1): 양압 and 음압 setpoints (room, count, supply,
+  exhaust, offset, needed, capped) and the "gas warning shown" flag. If it is
+  missing, both modes are "not set up".
 * Saved: mode, fan, all mode/function flags, AI, lock, heater, reservation
   hours, VSP (6 values), device ID.
 * Saved 2 s after the last change (from the UI or from MAIN via E5/E7/A6).
@@ -329,7 +357,7 @@ units (the PLC value itself). NVS blob version 3.
 
 | Page | Behaviour |
 |---|---|
-| 풍량 설정 (Airflow) | Row 0: mode – 환기 / 바이패스 / 청정 / 자동 / AI → `setModeState()`. Row 1: fan 약/중/강 → `setVolumeState()`. Left/Right edits, OK sends. Shows the current state (power, mode, fan, LOCK) and the result ("적용됨 – 다음 응답에 전송" or "LOCK – 무시됨"). |
+| 풍량 설정 (Airflow) | Row 0: mode – 전열 / 바이패스 / 청정 / 자동 / AI → `setModeState()`. Row 1: fan 약/중/강 → `setVolumeState()`. Left/Right edits, OK sends. Shows the current state (power, mode, fan, LOCK) and the result ("적용됨 – 다음 응답에 전송" or "LOCK – 무시됨"). |
 | 예약 설정 (Schedule) | Start / stop in 1–24 hours → `setReservationState()`. |
 | 기기 설정 → ID 설정 | Device ID 1–99 (decimal), OK saves → `setDeviceId()`. Shows the current ID and its hex byte. |
 | 기기 설정 → VSP 설정 | Shows stored VSP voltages (no voltage editor yet). |
@@ -420,3 +448,7 @@ Host-side test of `RcDto` + `PlcService` (g++, `-Wall -Wextra`, no warnings):
 * The old `plc_protocol` `request*()` / `desired()` API is now unused but left
   in place.
 * The 140 ms blocking reply delay in `plc_protocol` slows UI refresh.
+* Pressure modes: confirm on the line that MAIN applies a C5 at once and
+  whether it stores it in its own memory. Also confirm the real fan curve
+  (`RC_FAN_VSP_AT_ZERO` / `RC_FAN_VSP_AT_RATED`) and the rated airflow
+  (`RC_FAN_RATED_M3H`, placeholder 500 m³/h), and the room table values.

@@ -115,7 +115,7 @@ namespace PLC {
         // bit4,3 예비
         SLEEP_B5         = 0x04,    // 취침 0:해제 1:설정
         // bit1 예비
-        CO2_AUTO_CLEAN_B5= 0x01,    // 0:자동환기 1:자동청정 (SHR-L1 전용)
+        CO2_AUTO_CLEAN_B5= 0x01,    // 0:자동전열  1:자동청정 (SHR-L1 전용)
     };
 
 // ---- D6 (상태요청2) : Data1 비트 ----

@@ -49,20 +49,16 @@
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
-    /* Bumped from the 64K default: with 2 full dashboards + settings all
-     * built up front, object+style count got close enough to the old
-     * limit to be a real suspect for the "black screen" boot hangs -
-     * this is a static SRAM array (not PSRAM), so keep it well under
-     * the ~327K total budget rather than being maximally generous. */
-    #define LV_MEM_SIZE (128U * 1024U)          /*[bytes]*/
+    /* 3 full dashboards + settings are built up front. The pool is
+     * allocated from PSRAM at lv_init() (LV_MEM_POOL_ALLOC below), so it
+     * can be this large without taking internal SRAM from Wi-Fi. */
+    #define LV_MEM_SIZE (512U * 1024U)          /*[bytes]*/
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/
     /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc*/
-    #if LV_MEM_ADR == 0
-        #undef LV_MEM_POOL_INCLUDE
-        #undef LV_MEM_POOL_ALLOC
-    #endif
+    #define LV_MEM_POOL_INCLUDE "lv_mem_psram.h"
+    #define LV_MEM_POOL_ALLOC   lv_mem_psram_pool
 
 #else       /*LV_MEM_CUSTOM*/
     #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/

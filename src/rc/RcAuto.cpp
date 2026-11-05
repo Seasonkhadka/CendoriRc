@@ -33,7 +33,7 @@ AutoResult autoDecide(bool hasCo2, int co2, bool hasPm, int pm25, int pm10) {
 		}
 	}
 
-	// CO2 나쁨 이상: 환기 우선
+	// CO2 나쁨 이상: 전열  우선
 	if( c == AIR_VERY_BAD ) return { 3, false };
 	if( c == AIR_BAD ) return { 2, false };
 
@@ -42,7 +42,7 @@ AutoResult autoDecide(bool hasCo2, int co2, bool hasPm, int pm25, int pm10) {
 	if( p == AIR_BAD ) return { 2, true };
 	if( p == AIR_NORMAL ) return { 1, true };
 
-	// 둘 다 양호: CO2 보통이면 약풍 환기, 좋음이면 정지
+	// 둘 다 양호: CO2 보통이면 약풍 전열 , 좋음이면 정지
 	if( c == AIR_NORMAL ) return { 1, false };
 	return { 0, false };
 }

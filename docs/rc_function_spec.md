@@ -15,7 +15,7 @@ ERV용 룸 콘트롤러 – Room controller for ERV main units
    - 2.1 초기동작
    - 2.2 전원버튼
    - 2.3 예약 설정
-   - 2.4 모드 설정
+   - 2.4 모드 설정 (양압 / 음압 모드 2.4.8 ~ 2.4.10)
    - 2.5 필터 상태
    - 2.6 Up / Down 버튼
    - 2.7 에러코드
@@ -126,10 +126,13 @@ during sleep mode.
 ### 2.4 모드 설정
 
 2.4.1 Open 설정 → 풍량 설정. In the mode row, ◀ / ▶ select
-[환기 → 바이패스 → 청정 → 자동 → AI], and OK applies it. The mode can be
-changed only while the power is On.
+[전열 → 바이패스 → 청정 → 자동 → AI], and OK applies it. When 전열 or 바이패스 is
+picked, a second row "전열 방식" / "바이패스 방식" chooses [일반 → 양압 → 음압]:
+일반 is the normal balanced mode, 양압 / 음압 are the pressure modes (2.4.8) on
+that air path. The mode can be changed
+only while the power is On. Only one mode runs at a time.
 
-2.4.2 환기 (전열) 모드: ventilates through the heat-exchange element to reduce
+2.4.2 전열 (전열) 모드: ventilates through the heat-exchange element to reduce
 indoor energy loss.
 
 2.4.3 바이패스 모드: ventilates without passing the heat-exchange element, to
@@ -175,19 +178,113 @@ Table 4) 동작 상태 (자동모드)
 
 | CO2 센서 | 초미세먼지 센서 | 풍량 | 모드 |
 |---|---|---|---|
-| 매우나쁨 | - | 강풍 | 환기 |
-| 나쁨 | - | 중풍 | 환기 |
+| 매우나쁨 | - | 강풍 | 전열 |
+| 나쁨 | - | 중풍 | 전열 |
 | 보통 | 매우나쁨 | 강풍 | 청정 |
 | 보통 | 나쁨 | 중풍 | 청정 |
 | 보통 | 보통 | 약풍 | 청정 |
-| 보통 | 좋음 | 약풍 | 환기 |
+| 보통 | 좋음 | 약풍 | 전열 |
 | 좋음 | 매우나쁨 | 강풍 | 청정 |
 | 좋음 | 나쁨 | 중풍 | 청정 |
 | 좋음 | 보통 | 약풍 | 청정 |
 | 좋음 | 좋음 | 정지 | 정지 |
 
-When no sensor value is available, 자동모드 runs on 약풍, 환기.
+When no sensor value is available, 자동모드 runs on 약풍, 전열 .
 In auto clean, the dashboard mode badge shows "자동 청정 (AUTO CLEAN)".
+
+2.4.8 양압 모드 (Positive mode) / 음압 모드 (Negative mode)
+
+- 양압 모드: supply > exhaust. Keeps fine dust, odours and unfiltered outdoor
+  air out of the room.
+- 음압 모드: exhaust > supply. Keeps odours or contaminants inside the room.
+- Both are standalone modes like 전열 / 바이패스 / 청정 / 자동. The existing
+  four modes are unchanged and stay balanced.
+- Air path: 전열 양압 / 음압 go through the heat-exchange element (bypass closed),
+  바이패스 양압 / 음압 go through the bypass. 급기모드 / 배기모드 (single fan) are
+  switched off, because both fans run. The saved setpoints are the same for both
+  paths.
+- Fan: each fan runs at its own saved setpoint. The fan level keys do not
+  apply in these modes (the setpoint sets the airflow).
+- The main unit has only one shared fan speed. The RC therefore sends it
+  전열 or 바이패스 mode, plus a separate supply and exhaust VSP for the setpoint
+  in that path's VSP set (C5 전열 1/2 or 바이패스 3/4). 약풍 = setpoint, 중풍 =
+  CO2 boost.
+- Leaving the mode (any other mode, or 급기모드 / 배기모드): the RC sends the
+  normal VSP table back right away. The saved setpoints are kept.
+- Power loss: after restart the RC resumes the last mode, including 양압 /
+  음압, with the saved setpoints.
+- 예약 (가동예약 / 정지예약) only turns the power on / off. The mode is kept, so a
+  start reservation resumes 양압 / 음압 like any other mode.
+
+2.4.9 설정 마법사 (Setup wizard)
+
+The first time 양압 or 음압 is applied (under 전열 or 바이패스), the setup wizard
+opens instead.
+Nothing changes on the unit until 적용 (Apply) is pressed.
+
+1. 공간 종류 (Room type)
+2. 인원 (People) or 변기 수 (Toilets)
+3. 결과 (Result), e.g. "급기 320 m³/h · 배기 295 m³/h · 양압 모드 +8%" → [적용]
+
+Apply saves the setpoints and starts the mode. Later selections start the
+mode directly with the saved setpoints. 풍량 설정 → 전열 or 바이패스 → "양압/음압
+다시 설정 (Re-run pressure setup)" opens the wizard again.
+
+Table 5) 공간 종류 (RcConfig.h `RC_PRESS_*`, values to confirm)
+
+| 모드 | 공간 | 단위 풍량 | 차압 |
+|---|---|---|---|
+| 양압 | 개방형 사무실 (Open office) | 32 m³/h per person | +8% |
+| 양압 | 회의실 (Meeting room) | 32 m³/h per person | +5% |
+| 양압 | 개인 사무실 (Private office) | 32 m³/h per person | +5% |
+| 음압 | 화장실 (Restroom) | 90 m³/h per toilet (exhaust) | −10% |
+| 음압 | 기타 공간 (Other room) | 32 m³/h per person | −10% |
+
+Calculation:
+
+- Larger fan (supply in 양압, exhaust in 음압) = count × unit airflow, at least
+  50 m³/h, rounded up to 5 m³/h, at most the rated airflow
+  (`RC_FAN_RATED_M3H`).
+- Smaller fan = larger fan ÷ (1 + offset), rounded down to 5 m³/h, and at
+  least 5 m³/h below the larger fan. The VSP also keeps at least one 0.05 V
+  step of difference, so the direction of the offset never flips.
+- The airflow → VSP conversion is linear between `RC_FAN_VSP_AT_ZERO` and
+  `RC_FAN_VSP_AT_RATED` at the rated airflow (fan curve not confirmed).
+
+2.4.10 CO2 부스트 (only with the RC's CO2 sensor)
+
+- CO2 > 1000 ppm for 5 minutes → both fans +20%, same supply / exhaust ratio
+  (main unit fan level 중풍).
+- CO2 < 800 ppm for 10 minutes → back to the saved setpoints (약풍).
+- The rated airflow is never exceeded. If +20% would exceed it, both fans are
+  scaled down together.
+- While the boost runs, the screens show "CO₂ 부스트 (CO₂ boost)".
+
+Warnings (one sentence each: what is happening and what to do):
+
+| 경우 | 메시지 |
+|---|---|
+| Needed airflow > rated | 필요 풍량 400 m³/h가 정격 350 m³/h보다 커서 350 m³/h로 제한되니, 더 큰 장치를 검토하세요. / Unit too small: it needs 400 m³/h but is rated 350 m³/h, so it runs at 350 m³/h - consider a larger unit. |
+| First 음압 setup (shown once) | 음압 모드는 가스기기의 배기가스를 실내로 끌어들일 수 있으니, 가스기기를 쓸 때는 창문을 조금 열어 두세요. / Negative mode can pull fumes back from gas appliances, so open a window slightly while one is in use. |
+
+Table 6) 확인 결과 (expected)
+
+| 경우 | 급기 | 배기 | 결과 |
+|---|---|---|---|
+| 양압, 개방형 사무실, 10명 | 320 | 295 | +8% |
+| 양압, 회의실, 12명 | 385 | 365 | +5% |
+| 양압, 개인 사무실, 1명 | 50 (최소) | 45 | +5% |
+| 음압, 화장실, 변기 2개 | 160 | 180 | −10% |
+| 양압 중 CO2 1100 ppm 5분 | +20% | +20% | 비율 유지 |
+| 양압 → 자동 선택 | 자동 | 자동 | 원래 VSP, 자동 동작 |
+| 자동 → 양압 (설정 완료) | 320 | 295 | 저장값 사용 |
+| 음압 첫 선택 (설정 없음) | — | — | 마법사 열림 |
+| 음압 설정 결과 | — | — | 가스기기 경고 한 번 |
+| 양압 중 정전 후 재시작 | 320 | 295 | 양압 재개 |
+| 필요 400, 정격 350 | 350 | — | "장치 용량 부족" 경고 |
+
+The first four rows and the 400 / 350 row were checked with a PC test of
+the calculation. The other rows need a check on the unit.
 
 ### 2.5 필터 상태
 

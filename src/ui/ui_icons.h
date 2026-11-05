@@ -25,5 +25,9 @@ lv_obj_t *wifi_bars(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
 lv_obj_t *phone(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
 lv_obj_t *search(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
 lv_obj_t *disconnect(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
+// Pressure modes: room with arrows pointing out (양압 / positive) or in
+// (음압 / negative).
+lv_obj_t *pressure_out(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
+lv_obj_t *pressure_in(lv_obj_t *parent, lv_coord_t size, lv_color_t color);
 
 } // namespace ui_icons

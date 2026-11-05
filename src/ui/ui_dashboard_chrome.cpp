@@ -162,7 +162,7 @@ lv_obj_t *build_bottom_bar(lv_obj_t *parent) {
   build_stat_card(bar, ui_icons::dust, "PM2.5:", "--", "µg/m³", &s_pm25_val[idx]);
   build_stat_card(bar, ui_icons::dust, "PM10:", "--", "µg/m³", &s_pm10_val[idx]);
   build_stat_card(bar, ui_icons::cloud, "CO₂:", "--", "ppm", &s_co2_val[idx]);
-  build_stat_card(bar, nullptr, "TVOC:", "--", "µg/m³", &s_tvoc_val[idx]);
+  build_stat_card(bar, nullptr, "TVOC:", "--", "ppb", &s_tvoc_val[idx]);
   build_stat_card(bar, ui_icons::gasring, "CO:", "--", "ppm", &s_co_val[idx]);
   build_stat_card(bar, ui_icons::thermo, "Temp:", "--", "--", &s_temp_val[idx], &s_hum_val[idx], true);
 
@@ -235,10 +235,10 @@ void set_co2(int ppm) {
   }
 }
 
-void set_tvoc(int ug) {
+void set_tvoc(int ppb) {
   char buf[12];
-  if (ug < 0) snprintf(buf, sizeof(buf), "--");
-  else snprintf(buf, sizeof(buf), "%d", ug);
+  if (ppb < 0) snprintf(buf, sizeof(buf), "--");
+  else snprintf(buf, sizeof(buf), "%d", ppb);
   for (int i = 0; i < s_bottomBarCount; i++) {
     if (s_tvoc_val[i]) lv_label_set_text(s_tvoc_val[i], buf);
   }

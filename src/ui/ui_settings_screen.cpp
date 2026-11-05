@@ -169,7 +169,9 @@ int s_panel_row = 0;
 struct SettingsData {
   // Local picks for the RC controls - seeded from RcController state on
   // entering the panel, sent only by fire_*() on OK.
-  int ahu_mode = 0;        // RC::UiMode: 0 환기 / 1 바이패스 / 2 청정 / 3 자동 / 4 AI
+  int ahu_mode = 0;        // top-level mode: 0 전열 / 1 바이패스 / 2 청정 / 3 자동 / 4 AI
+  int vent_sub = 0;        // 전열 / 바이패스 방식: 0 일반 (balanced) / 1 양압 / 2 음압
+  int press_kind = RC::PRESS_POSITIVE; // "다시 설정" row: which pressure mode to set up again
   int ahu_volume = 1;      // 1 low / 2 mid / 3 high (stop = power key)
   int resv_type = 0;       // 0 가동예약 / 1 정지예약 / 2 취침 / 3 취소 (old RC order)
   int resv_min = 60;       // 10..1440, 10-minute steps
@@ -189,6 +191,18 @@ bool s_langChanged = false;
 
 SettingsData s_data;
 SettingsData s_snap;
+
+// Pressure-mode setup wizard (Airflow panel): room type -> people / toilets ->
+// result -> [적용]. Only Apply reaches the controller; nothing before it
+// changes the unit.
+struct PressWizard {
+  bool open = false;
+  uint8_t kind = RC::PRESS_POSITIVE;
+  int step = 0;   // 0 room type, 1 count, 2 result
+  int room = 0;
+  int count = 1;
+};
+PressWizard s_wiz;
 
 int wrap(int v, int n) { return (v % n + n) % n; }
 
@@ -213,23 +227,55 @@ void restore_data() { s_data = s_snap; }
 // a controller command: the change reaches MAIN in the next poll reply.
 RcDto s_rc;
 lv_obj_t *s_screen = nullptr;
-char s_ahuResultBuf[48] = "";
+char s_ahuResultBuf[96] = "";
 const char *s_ahuResultMsg = nullptr;
 
 
 void show_result(bool ok) {
   snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s",
            ok ? tr("적용됨 - 다음 응답에 전송", "Queued - sent in the next reply")
-              : tr("무시됨 - LOCK/OFF/AUTO/취침", "Ignored - LOCK/OFF/AUTO/SLEEP"));
+              : tr("무시됨 - LOCK/OFF/AUTO/취침/양압·음압", "Ignored - LOCK/OFF/AUTO/SLEEP/PRESSURE"));
   s_ahuResultMsg = s_ahuResultBuf;
   refresh_content();
 }
 
-// Mode only - fan speed and power are untouched.
+void open_wizard(uint8_t kind) {
+  int n = 0;
+  const RC::PressureRoom *rooms = RC::pressureRooms(kind, n);
+  const RC::PressureSetup *saved = s_rc.pressureSetup(kind);
+  const bool have = saved && saved->valid && saved->room < n;
+  s_wiz.open = true;
+  s_wiz.kind = kind;
+  s_wiz.step = 0;
+  s_wiz.room = have ? saved->room : 0;
+  s_wiz.count = have ? saved->count : rooms[s_wiz.room].defCount;
+  s_ahuResultMsg = nullptr;
+  refresh_content();
+}
+
+// Mode only - fan speed and power are untouched. A pressure mode that was
+// never set up opens the setup wizard instead (nothing is sent).
 void fire_mode() {
-  static const char *names[RC::UI_MODE_COUNT] = {"ventilation", "bypass", "clean", "auto", "ai"};
-  bool ok = RcController::instance().setModeState(names[s_data.ahu_mode]);
+  static const char *names[RC::UI_MODE_COUNT] = {"ventilation", "bypass", "clean", "auto", "ai",
+                                                 "positive",    "negative", "bypass_positive", "bypass_negative"};
+  // 전열 / 바이패스 + 양압 / 음압 -> the RC pressure modes on that air path;
+  // + 일반 -> plain ventilation / bypass.
+  int m = s_data.ahu_mode;
+  if (m == RC::UI_VENTILATION && s_data.vent_sub == 1) m = RC::UI_POSITIVE;
+  if (m == RC::UI_VENTILATION && s_data.vent_sub == 2) m = RC::UI_NEGATIVE;
+  if (m == RC::UI_BYPASS && s_data.vent_sub == 1) m = RC::UI_BP_POSITIVE;
+  if (m == RC::UI_BYPASS && s_data.vent_sub == 2) m = RC::UI_BP_NEGATIVE;
+  if (m >= RC::UI_POSITIVE) {
+    const uint8_t kind = (m == RC::UI_POSITIVE || m == RC::UI_BP_POSITIVE) ? RC::PRESS_POSITIVE : RC::PRESS_NEGATIVE;
+    const RC::PressureSetup *saved = s_rc.pressureSetup(kind);
+    if (!saved || !saved->valid) {
+      open_wizard(kind);
+      return;
+    }
+  }
+  bool ok = RcController::instance().setModeState(names[m]);
   s_snap.ahu_mode = s_data.ahu_mode;
+  s_snap.vent_sub = s_data.vent_sub;
   show_result(ok);
 }
 
@@ -388,7 +434,8 @@ void build_ahu_status_strip(lv_obj_t *parent) {
 // Current RC state (what the next reply to MAIN will carry), separate from
 // the editable pick below.
 void build_ahu_confirmed_badge(lv_obj_t *parent) {
-  static const char *modeShort[RC::UI_MODE_COUNT] = {"Ventilation", "Bypass", "Clean", "Auto", "AI"};
+  static const char *modeShort[RC::UI_MODE_COUNT] = {"Ventilation", "Bypass", "Clean", "Auto", "AI",
+                                                     "Positive",    "Negative", "Bypass positive", "Bypass negative"};
   char buf[96];
   snprintf(buf, sizeof(buf), "%s: %s / %s / Fan %d%s%s", tr("현재 상태", "State"),
            s_rc.isRunning() ? "ON" : "OFF",
@@ -396,6 +443,19 @@ void build_ahu_confirmed_badge(lv_obj_t *parent) {
            s_rc.ahuLock ? " / LOCK" : "");
   lv_obj_t *l = make_label(parent, buf, &ui_font_xs, TEXT_DIM);
   lv_obj_set_flex_grow(l, 0);
+
+  // Pressure-mode status: both airflows, offset, CO2 boost.
+  uint16_t sup = 0, exh = 0;
+  if (s_rc.pressureAirflow(sup, exh)) {
+    const RC::PressureSetup *ps = s_rc.pressureSetup(s_rc.pressure);
+    const bool pos = s_rc.pressure == RC::PRESS_POSITIVE;
+    snprintf(buf, sizeof(buf), "%s %c%u%%  %s %u m³/h · %s %u m³/h%s", pos ? tr("양압 모드", "Positive mode")
+             : tr("음압 모드", "Negative mode"), pos ? '+' : '-', (unsigned)ps->offsetPct, tr("급기", "Supply"),
+             (unsigned)sup, tr("배기", "Exhaust"), (unsigned)exh,
+             s_rc.pressBoost ? tr(" · CO₂ 부스트 동작 중", " · CO₂ boost active") : "");
+    lv_obj_t *pl = make_label(parent, buf, &ui_font_xs, ACCENT_CYAN);
+    lv_obj_set_flex_grow(pl, 0);
+  }
 }
 
 // ---- Airflow section -> repurposed as live AHU control -----------------
@@ -404,37 +464,110 @@ void build_ahu_confirmed_badge(lv_obj_t *parent) {
 // (handle_ok()) sends the focused row's command and stays in the panel;
 // Back discards whatever was picked but never sent (see handle_back()).
 
+void build_pressure_wizard(lv_obj_t *parent);
+
+// Airflow panel rows. 전열 and 바이패스 show their 방식 row (일반 / 양압 / 음압)
+// and the pressure re-run row; the other modes show only mode + fan.
+enum AirRow { AIR_MODE, AIR_VENT, AIR_FAN, AIR_RERUN };
+
+bool vent_picked() { return s_data.ahu_mode == RC::UI_VENTILATION || s_data.ahu_mode == RC::UI_BYPASS; }
+
+int airflow_row_count() { return vent_picked() ? 4 : 2; }
+
+AirRow airflow_row(int idx) {
+  static const AirRow vent[4] = {AIR_MODE, AIR_VENT, AIR_FAN, AIR_RERUN};
+  static const AirRow other[2] = {AIR_MODE, AIR_FAN};
+  return vent_picked() ? vent[idx < 4 ? idx : 0] : other[idx < 2 ? idx : 0];
+}
+
+bool airflow_focused(AirRow r) { return airflow_row(s_panel_row) == r; }
+
+// One choice in a row card: white filled pill when picked, plain text
+// otherwise - the only selection indicator. icon: 0 none, 1 양압, 2 음압.
+void make_choice(lv_obj_t *parent, const char *text, bool sel, int icon) {
+  lv_obj_t *pill = make_plain(parent);
+  lv_obj_set_height(pill, LV_PCT(100));
+  lv_obj_set_flex_grow(pill, 1);
+  lv_obj_set_style_radius(pill, 12, 0);
+  lv_obj_set_style_bg_color(pill, c(PILL_BG), 0);
+  lv_obj_set_style_bg_opa(pill, sel ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+  lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(pill, 5, 0);
+  const uint32_t col = sel ? PILL_TEXT : TEXT_SECONDARY;
+  if (icon == 1) ui_icons::pressure_out(pill, 16, c(col));
+  if (icon == 2) ui_icons::pressure_in(pill, 16, c(col));
+  make_label(pill, text, &ui_font_sm, col);
+}
+
+// Row card: optional title on the left, choices filling the rest.
+lv_obj_t *make_choice_card(lv_obj_t *parent, lv_coord_t h, const char *title, bool focused) {
+  lv_obj_t *card = make_card(parent, CARD_BG);
+  lv_obj_set_size(card, LV_PCT(100), h);
+  lv_obj_set_flex_grow(card, 0);
+  lv_obj_set_style_pad_all(card, 6, 0);
+  lv_obj_set_style_pad_left(card, title ? 16 : 6, 0);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(card, 6, 0);
+  apply_focus_frame(card, focused);
+  if (title) {
+    lv_obj_t *t = make_label(card, title, &ui_font_xs, TEXT_PRIMARY);
+    lv_obj_set_width(t, 76);
+  }
+  return card;
+}
+
 void build_airflow_panel(lv_obj_t *parent) {
+  if (s_wiz.open) {
+    build_pressure_wizard(parent);
+    return;
+  }
   build_ahu_confirmed_badge(parent);
 
-  static const char *modeMain[RC::UI_MODE_COUNT] = {"환기", "바이패스", "청정", "자동", "AI"};
-  static const char *modeEn[RC::UI_MODE_COUNT] = {"Vent", "Bypass", "Clean", "Auto", "AI"};
+  // Row: mode (전열 / 바이패스 / 청정 / 자동 / AI)
+  static const char *modeMain[5] = {"전열", "바이패스", "청정", "자동", "AI"};
+  static const char *modeEn[5] = {"Vent", "Bypass", "Clean", "Auto", "AI"};
+  lv_obj_t *mode_card = make_choice_card(parent, 52, nullptr, airflow_focused(AIR_MODE));
+  for (int i = 0; i < 5; i++) make_choice(mode_card, tr(modeMain[i], modeEn[i]), i == s_data.ahu_mode, 0);
 
-  lv_obj_t *mode_row = make_row(parent, LV_PCT(100), 72, 8);
-  lv_obj_set_flex_grow(mode_row, 0);
-  apply_focus_frame(mode_row, s_panel_row == 0);
-  for (int i = 0; i < RC::UI_MODE_COUNT; i++) {
-    make_mode_option(mode_row, tr(modeMain[i], modeEn[i]), "", i == s_data.ahu_mode);
+  // Row: 전열 / 바이패스 방식 (only under those two) - 일반 / 양압 / 음압
+  if (vent_picked()) {
+    static const char *subMain[3] = {"일반", "양압", "음압"};
+    static const char *subEn[3] = {"Normal", "Positive", "Negative"};
+    const bool bp = s_data.ahu_mode == RC::UI_BYPASS;
+    lv_obj_t *sub = make_choice_card(parent, 48, bp ? tr("바이패스 방식", "Bypass type") : tr("전열 방식", "Vent type"),
+                                     airflow_focused(AIR_VENT));
+    for (int i = 0; i < 3; i++) make_choice(sub, tr(subMain[i], subEn[i]), i == s_data.vent_sub, i);
   }
 
+  // Row: fan level
   static const char *volMain[3] = {"약", "중", "강"};
   static const char *volEn[3] = {"Low", "Mid", "High"};
-  lv_obj_t *vol_row = make_card(parent, CARD_BG);
-  lv_obj_set_size(vol_row, LV_PCT(100), 72);
-  lv_obj_set_flex_grow(vol_row, 0);
-  lv_obj_set_style_pad_hor(vol_row, 16, 0);
-  lv_obj_set_flex_flow(vol_row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  apply_focus_frame(vol_row, s_panel_row == 1);
-  lv_obj_t *vol_label = make_plain(vol_row);
-  lv_obj_set_size(vol_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-  lv_obj_set_flex_flow(vol_label, LV_FLEX_FLOW_COLUMN);
-  make_label(vol_label, tr("풍량", "Fan"), &ui_font_sm, TEXT_PRIMARY);
-  if (ui_lang::en()) make_label(vol_label, "Volume", &ui_font_xs, TEXT_SECONDARY);
-  lv_obj_t *vol_options = make_row(vol_row, LV_PCT(100), LV_PCT(100), 4);
-  lv_obj_set_flex_grow(vol_options, 1);
-  for (int i = 0; i < 3; i++) {
-    make_level_option(vol_options, tr(volMain[i], volEn[i]), "", i + 1 == s_data.ahu_volume);
+  lv_obj_t *vol = make_choice_card(parent, 48, tr("풍량", "Fan"), airflow_focused(AIR_FAN));
+  for (int i = 0; i < 3; i++) make_choice(vol, tr(volMain[i], volEn[i]), i + 1 == s_data.ahu_volume, 0);
+
+  // Row: re-run the pressure setup (only under 전열 / 바이패스) - plain text.
+  // Left/Right picks 양압 / 음압, OK opens the wizard.
+  if (vent_picked()) {
+    lv_obj_t *rerun = make_card(parent, CARD_BG);
+    lv_obj_set_size(rerun, LV_PCT(100), 40);
+    lv_obj_set_flex_grow(rerun, 0);
+    lv_obj_set_style_pad_hor(rerun, 16, 0);
+    lv_obj_set_flex_flow(rerun, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rerun, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    const bool focus = airflow_focused(AIR_RERUN);
+    apply_focus_frame(rerun, focus);
+    make_label(rerun, tr("양압/음압 다시 설정", "Re-run pressure setup"), &ui_font_xs, TEXT_PRIMARY);
+    const uint8_t k = (uint8_t)s_data.press_kind;
+    const RC::PressureSetup *ps = s_rc.pressureSetup(k);
+    char sub[24];
+    if (ps && ps->valid) snprintf(sub, sizeof(sub), "%c%u%%", k == RC::PRESS_POSITIVE ? '+' : '-', (unsigned)ps->offsetPct);
+    else snprintf(sub, sizeof(sub), "%s", tr("미설정", "Not set"));
+    char text[64];
+    snprintf(text, sizeof(text), (s_in_panel && focus) ? "<  %s %s  >" : "%s %s",
+             k == RC::PRESS_POSITIVE ? tr("양압", "Positive") : tr("음압", "Negative"), sub);
+    make_label(rerun, text, &ui_font_xs, (s_in_panel && focus) ? TEXT_PRIMARY : TEXT_SECONDARY);
   }
 
   build_ahu_status_strip(parent);
@@ -1082,6 +1215,166 @@ int days_in_month(int y, int m) {
   return kDays[m];
 }
 
+// ---- Pressure-mode setup wizard -----------------------------------------
+
+const char *count_unit(const RC::PressureRoom &r) {
+  return r.countKind == RC::COUNT_TOILETS ? tr("개", "toilets") : tr("명", "people");
+}
+
+void wizard_apply() {
+  RC::PressureSetup r = {};
+  const uint8_t kind = s_wiz.kind;
+  const bool pos = kind == RC::PRESS_POSITIVE;
+  // Starts on the air path picked on the page (전열 / 바이패스).
+  const bool bpPath = s_data.ahu_mode == RC::UI_BYPASS;
+  const bool started =
+      RcController::instance().applyPressureSetup(kind, (uint8_t)s_wiz.room, (uint8_t)s_wiz.count, bpPath, &r);
+  if (kind == RC::PRESS_NEGATIVE && !s_rc.gasWarned) RcController::instance().markGasWarned();
+  s_wiz.open = false;
+  if (started) {
+    s_data.ahu_mode = s_snap.ahu_mode = bpPath ? RC::UI_BYPASS : RC::UI_VENTILATION;
+    s_data.vent_sub = s_snap.vent_sub = pos ? 1 : 2;
+    snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s",
+             pos ? tr("양압 모드 시작 - 설정 저장됨", "Positive mode on - setpoints saved")
+                 : tr("음압 모드 시작 - 설정 저장됨", "Negative mode on - setpoints saved"));
+  } else {
+    snprintf(s_ahuResultBuf, sizeof(s_ahuResultBuf), "%s",
+             tr("설정 저장됨 - 전원 Off/잠금이라 시작 안 함", "Saved - not started (power off or locked)"));
+  }
+  s_ahuResultMsg = s_ahuResultBuf;
+  refresh_content();
+}
+
+// Wizard keys while it is open on the Airflow panel. Returns true if used.
+bool wizard_key(Key k) {
+  if (!(s_wiz.open && s_in_panel && s_mode == Mode::Outer && s_selected == 0)) return false;
+  int n = 0;
+  const RC::PressureRoom *rooms = RC::pressureRooms(s_wiz.kind, n);
+  const RC::PressureRoom &rt = rooms[s_wiz.room];
+  int delta = 0;
+  switch (k) {
+    case Key::Left: delta = -1; break;
+    case Key::Right: delta = 1; break;
+    case Key::Up: delta = s_wiz.step == 1 ? 1 : 0; break;
+    case Key::Down: delta = s_wiz.step == 1 ? -1 : 0; break;
+    case Key::Ok:
+      if (s_wiz.step < 2) s_wiz.step++;
+      else {
+        wizard_apply();
+        return true;
+      }
+      break;
+    case Key::Back:
+      if (s_wiz.step > 0) s_wiz.step--;
+      else s_wiz.open = false;  // closed, nothing changed on the unit
+      break;
+  }
+  if (delta && s_wiz.step == 0) {
+    s_wiz.room = wrap(s_wiz.room + delta, n);
+    s_wiz.count = rooms[s_wiz.room].defCount;  // people <-> toilets: start from that room's default
+  } else if (delta && s_wiz.step == 1) {
+    s_wiz.count += delta;
+    if (s_wiz.count < 1) s_wiz.count = 1;
+    if (s_wiz.count > rt.maxCount) s_wiz.count = rt.maxCount;
+  }
+  refresh_content();
+  return true;
+}
+
+void build_pressure_wizard(lv_obj_t *parent) {
+  const uint8_t kind = s_wiz.kind;
+  const bool pos = kind == RC::PRESS_POSITIVE;
+  int n = 0;
+  const RC::PressureRoom *rooms = RC::pressureRooms(kind, n);
+  const RC::PressureRoom &rt = rooms[s_wiz.room];
+  const char *modeName = pos ? tr("양압 모드", "Positive mode") : tr("음압 모드", "Negative mode");
+  char buf[160];
+
+  // Header: icon, "양압 모드 설정", step n/3
+  lv_obj_t *head = make_row(parent, LV_PCT(100), 36, 10);
+  lv_obj_set_flex_grow(head, 0);
+  if (pos) ui_icons::pressure_out(head, 30, c(ACCENT_CYAN));
+  else ui_icons::pressure_in(head, 30, c(ACCENT_CYAN));
+  snprintf(buf, sizeof(buf), "%s %s", modeName, tr("설정", "setup"));
+  lv_obj_t *title = make_label(head, buf, &ui_font_md, TEXT_PRIMARY);
+  lv_obj_set_flex_grow(title, 1);
+  snprintf(buf, sizeof(buf), "%d / 3", s_wiz.step + 1);
+  make_label(head, buf, &ui_font_xs, TEXT_DIM);
+
+  static const char *stepKo[3] = {"공간 종류를 고르세요", "", "결과를 확인하고 적용하세요"};
+  static const char *stepEn[3] = {"Choose the room type", "", "Check the result, then apply"};
+  if (s_wiz.step == 1) {
+    snprintf(buf, sizeof(buf), "%s", rt.countKind == RC::COUNT_TOILETS ? tr("변기 수를 정하세요", "Set the number of toilets")
+                                                                      : tr("인원 수를 정하세요", "Set the number of people"));
+  } else {
+    snprintf(buf, sizeof(buf), "%s", tr(stepKo[s_wiz.step], stepEn[s_wiz.step]));
+  }
+  lv_obj_t *hint = make_label(parent, buf, &ui_font_xs, TEXT_SECONDARY);
+  lv_obj_set_flex_grow(hint, 0);
+
+  lv_obj_t *card = make_card(parent, CARD_BG);
+  lv_obj_set_width(card, LV_PCT(100));
+  lv_obj_set_flex_grow(card, 1);
+  lv_obj_set_style_pad_all(card, 12, 0);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(card, 8, 0);
+  apply_focus_frame(card, true);
+
+  if (s_wiz.step == 0) {
+    lv_obj_t *opts = make_row(card, LV_PCT(100), 64, 8);
+    for (int i = 0; i < n; i++) make_mode_option(opts, tr(rooms[i].ko, rooms[i].en), "", i == s_wiz.room);
+    snprintf(buf, sizeof(buf), "%s %u m³/h · %s %c%u%%",
+             rt.countKind == RC::COUNT_TOILETS ? tr("변기 1개당", "Per toilet") : tr("1인당", "Per person"),
+             (unsigned)rt.perUnit, modeName, pos ? '+' : '-', (unsigned)rt.offsetPct);
+    make_label(card, buf, &ui_font_xs, TEXT_DIM);
+  } else if (s_wiz.step == 1) {
+    lv_obj_t *stepper = make_row(card, LV_PCT(100), 80, 0);
+    lv_obj_set_flex_align(stepper, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(stepper, 24, 0);
+    make_step_key(stepper, "-", s_wiz.count > 1);
+    lv_obj_t *value = make_row(stepper, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 10);
+    lv_obj_set_flex_align(value, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    snprintf(buf, sizeof(buf), "%d", s_wiz.count);
+    make_label(value, buf, &ui_font_xxl, TEXT_PRIMARY);
+    make_label(value, count_unit(rt), &ui_font_md, TEXT_SECONDARY);
+    make_step_key(stepper, "+", s_wiz.count < rt.maxCount);
+    make_label(card, tr(rt.ko, rt.en), &ui_font_xs, TEXT_DIM);
+  } else {
+    // Preview only - the unit changes when Apply is pressed.
+    const RC::PressureSetup r = RC::pressureCompute(kind, (uint8_t)s_wiz.room, (uint8_t)s_wiz.count);
+    snprintf(buf, sizeof(buf), "%s · %d%s", tr(rt.ko, rt.en), s_wiz.count, count_unit(rt));
+    make_label(card, buf, &ui_font_xs, TEXT_DIM);
+    snprintf(buf, sizeof(buf), "%s %u m³/h · %s %u m³/h", tr("급기", "Supply"), (unsigned)r.supply,
+             tr("배기", "Exhaust"), (unsigned)r.exhaust);
+    make_label(card, buf, &ui_font_md, TEXT_PRIMARY);
+    snprintf(buf, sizeof(buf), "%s %c%u%%", modeName, pos ? '+' : '-', (unsigned)r.offsetPct);
+    make_label(card, buf, &ui_font_sm, ACCENT_CYAN);
+    if (!r.capped && (uint32_t)s_wiz.count * rt.perUnit < RC_PRESS_MIN_M3H) {
+      snprintf(buf, sizeof(buf), tr("최소 풍량 %d m³/h 적용", "Minimum airflow %d m³/h applied"), RC_PRESS_MIN_M3H);
+      make_label(card, buf, &ui_font_xs, TEXT_DIM);
+    }
+    // Warnings: one plain sentence each - what is happening and what to do.
+    if (r.capped) {
+      snprintf(buf, sizeof(buf),
+               tr("필요 풍량 %u m³/h가 정격 %u m³/h보다 커서 %u m³/h로 제한되니, 더 큰 장치를 검토하세요.",
+                  "Unit too small: it needs %u m³/h but is rated %u m³/h, so it runs at %u m³/h - consider a larger unit."),
+               (unsigned)r.needed, (unsigned)RC_FAN_RATED_M3H, (unsigned)RC_FAN_RATED_M3H);
+      lv_obj_t *w = make_wrap_label(card, buf, &ui_font_xs, WARN);
+      lv_obj_set_style_text_align(w, LV_TEXT_ALIGN_CENTER, 0);
+    }
+    if (!pos && !s_rc.gasWarned) {
+      lv_obj_t *w = make_wrap_label(card,
+                                    tr("음압 모드는 가스기기의 배기가스를 실내로 끌어들일 수 있으니, 가스기기를 쓸 때는 창문을 조금 열어 두세요.",
+                                       "Negative mode can pull fumes back from gas appliances, so open a window slightly while one is in use."),
+                                    &ui_font_xs, WARN);
+      lv_obj_set_style_text_align(w, LV_TEXT_ALIGN_CENTER, 0);
+    }
+    lv_obj_t *apply_row = make_row(card, 140, 40, 0);
+    make_mode_option(apply_row, tr("적용", "Apply"), "", true);
+  }
+}
+
 void clamp_clock_day() {
   const int maxd = days_in_month(s_data.clock_y, s_data.clock_mo);
   if (s_data.clock_d > maxd) s_data.clock_d = maxd;
@@ -1641,7 +1934,13 @@ void footer_add_icons(const char *icons, const char *text) {
 void set_footer() {
   if (!s_footerBar) return; // footer bar not built yet - see create()'s ordering note
   lv_obj_clean(s_footerBar);
-  if (s_in_panel && s_mode == Mode::Outer && s_selected == 1) {
+  if (s_in_panel && s_mode == Mode::Outer && s_selected == 0 && s_wiz.open) {
+    footer_add_ok(s_wiz.step == 2 ? tr("적용", "Apply") : tr("다음", "Next"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_RIGHT, tr("변경", "Change"));
+    footer_add_sep();
+    footer_add_icons(LV_SYMBOL_NEW_LINE, s_wiz.step == 0 ? tr("닫기", "Close") : tr("뒤로", "Back"));
+  } else if (s_in_panel && s_mode == Mode::Outer && s_selected == 1) {
     footer_add_ok(tr("예약 시작", "Start"));
     footer_add_sep();
     footer_add_icons(LV_SYMBOL_LEFT LV_SYMBOL_RIGHT, tr("변경", "Change"));
@@ -1854,8 +2153,16 @@ void enter_panel() {
   s_wifiView = WifiView::Main;
   // Seed the local pick from the current RC state.
   if (s_mode == Mode::Outer && s_selected == 0) {
-    s_data.ahu_mode = s_rc.uiMode();
+    // 양압 / 음압 are 전열 / 바이패스 sub-types on this page.
+    const RC::UiMode um = s_rc.uiMode();
+    if (um == RC::UI_POSITIVE || um == RC::UI_NEGATIVE) s_data.ahu_mode = RC::UI_VENTILATION;
+    else if (um == RC::UI_BP_POSITIVE || um == RC::UI_BP_NEGATIVE) s_data.ahu_mode = RC::UI_BYPASS;
+    else s_data.ahu_mode = um;
+    s_data.vent_sub = (um == RC::UI_POSITIVE || um == RC::UI_BP_POSITIVE) ? 1
+                      : ((um == RC::UI_NEGATIVE || um == RC::UI_BP_NEGATIVE) ? 2 : 0);
     s_data.ahu_volume = s_rc.volume == 0 ? 1 : s_rc.volume;
+    s_data.press_kind = s_rc.pressure == RC::PRESS_NEGATIVE ? RC::PRESS_NEGATIVE : RC::PRESS_POSITIVE;
+    s_wiz.open = false;
   }
   if (s_mode == Mode::Outer && s_selected == 1) {
     s_data.resv_type = 0;
@@ -1929,6 +2236,7 @@ void leave_panel(bool save) {
   }
   s_in_panel = false;
   s_panel_row = 0;
+  s_wiz.open = false;
   refresh_content();
 }
 
@@ -1939,7 +2247,7 @@ int panel_row_count() {
     return 2;
   }
   switch (s_selected) {
-    case 0: return 2; // mode / fan volume
+    case 0: return airflow_row_count(); // mode [/ 전열 방식] / fan [/ re-run pressure setup]
     case 1: return 2; // reservation: type / time
     case 2: return 3; // wifi: pair / scan / disconnect
     case 3: return 1; // filter: reset
@@ -1975,8 +2283,17 @@ void panel_adjust(int delta) {
   switch (s_selected) {
     case 0:
       // Local pick only - nothing is sent until OK (see handle_ok()).
-      if (s_panel_row == 0) s_data.ahu_mode = wrap(s_data.ahu_mode + delta, RC::UI_MODE_COUNT);
-      else s_data.ahu_volume = wrap(s_data.ahu_volume - 1 + delta, 3) + 1;
+      switch (airflow_row(s_panel_row)) {
+        case AIR_MODE: s_data.ahu_mode = wrap(s_data.ahu_mode + delta, 5); break;
+        case AIR_VENT:
+          s_data.vent_sub = wrap(s_data.vent_sub + delta, 3);
+          if (s_data.vent_sub) s_data.press_kind = s_data.vent_sub;  // re-run row follows the pick
+          break;
+        case AIR_FAN: s_data.ahu_volume = wrap(s_data.ahu_volume - 1 + delta, 3) + 1; break;
+        case AIR_RERUN:
+          s_data.press_kind = s_data.press_kind == RC::PRESS_POSITIVE ? RC::PRESS_NEGATIVE : RC::PRESS_POSITIVE;
+          break;
+      }
       break;
     case 1: {
       const int steps = RC_RESERVE_MAX_MIN / RC_RESERVE_STEP_MIN;
@@ -2070,6 +2387,7 @@ void set_wifi_state(const WifiDto &state) {
 
 void handle_up() {
   if (wifi_key(Key::Up)) return;
+  if (wizard_key(Key::Up)) return;
   if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
     s_pinDigit[s_pinPos] = wrap(s_pinDigit[s_pinPos] + 1, 10);
     s_pinWrong = false;
@@ -2094,6 +2412,7 @@ void handle_up() {
 
 void handle_down() {
   if (wifi_key(Key::Down)) return;
+  if (wizard_key(Key::Down)) return;
   if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
     s_pinDigit[s_pinPos] = wrap(s_pinDigit[s_pinPos] - 1, 10);
     s_pinWrong = false;
@@ -2118,6 +2437,7 @@ void handle_down() {
 
 void handle_left() {
   if (wifi_key(Key::Left)) return;
+  if (wizard_key(Key::Left)) return;
   if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
     s_pinPos = wrap(s_pinPos - 1, 4);
     refresh_content();
@@ -2136,6 +2456,7 @@ void handle_left() {
 
 void handle_right() {
   if (wifi_key(Key::Right)) return;
+  if (wizard_key(Key::Right)) return;
   if (s_pinOpen && s_mode == Mode::Outer && s_selected == 6) {
     s_pinPos = wrap(s_pinPos + 1, 4);
     refresh_content();
@@ -2154,14 +2475,19 @@ void handle_right() {
 
 void handle_ok() {
   if (wifi_key(Key::Ok)) return;
+  if (wizard_key(Key::Ok)) return;
   if (s_in_panel) {
     if (s_mode == Mode::Outer && s_selected == 0) {
       // AHU control: OK sends ONLY the focused row's command - Left/Right
       // only edited the local pick, nothing was sent yet. Stays in the
       // panel afterward (success or failure) so other rows can still be
       // picked and sent in the same visit; Back is what leaves.
-      if (s_panel_row == 0) fire_mode();
-      else fire_volume();
+      switch (airflow_row(s_panel_row)) {
+        case AIR_MODE:
+        case AIR_VENT: fire_mode(); break;
+        case AIR_FAN: fire_volume(); break;
+        case AIR_RERUN: open_wizard((uint8_t)s_data.press_kind); break;
+      }
       return;
     }
     if (s_mode == Mode::Outer && s_selected == 1) {
@@ -2192,6 +2518,7 @@ void handle_ok() {
 
 bool handle_back() {
   if (wifi_key(Key::Back)) return true;
+  if (wizard_key(Key::Back)) return true;
   if (s_in_panel) {
     // AHU control (s_selected == 0) needs no special case here anymore:
     // the generic restore_data() below correctly discards only whatever

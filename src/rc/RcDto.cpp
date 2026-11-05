@@ -28,6 +28,7 @@ RcDto::RcDto() {
 	hoodLink = false;
 	autoVolume = 1;
 	autoClean = false;
+	pressBoost = false;
 	extTemp = 0;
 	extHumidity = 0;
 	extPm25 = 0;
@@ -59,6 +60,10 @@ RcDto& RcDto::operator=(const RcDto& other) {
 	night = other.night;
 	dust = other.dust;
 	aiMode = other.aiMode;
+	pressure = other.pressure;
+	pressPos = other.pressPos;
+	pressNeg = other.pressNeg;
+	gasWarned = other.gasWarned;
 	deviceId = other.deviceId;
 	startMin = other.startMin;
 	stopMin = other.stopMin;
@@ -77,6 +82,7 @@ RcDto& RcDto::operator=(const RcDto& other) {
 	vspBpSupplyH = other.vspBpSupplyH;
 	autoVolume = other.autoVolume;
 	autoClean = other.autoClean;
+	pressBoost = other.pressBoost;
 
 	errCode = other.errCode;
 	outdoorTemp = other.outdoorTemp;
@@ -116,6 +122,10 @@ void RcDto::setDefaults() {
 	night = false;
 	dust = false;
 	aiMode = false;
+	pressure = RC::PRESS_NONE;
+	pressPos = RC::PressureSetup();
+	pressNeg = RC::PressureSetup();
+	gasWarned = false;
 	deviceId = DEFAULT_DEVICE_ID;
 	startMin = 60;
 	stopMin = 60;
@@ -135,8 +145,17 @@ void RcDto::setDefaults() {
 	vspBpSupplyH = vspSupplyH;
 }
 
+namespace {
+bool sameSetup(const RC::PressureSetup& a, const RC::PressureSetup& b) {
+	return a.valid == b.valid && a.room == b.room && a.count == b.count && a.supply == b.supply &&
+		a.exhaust == b.exhaust && a.offsetPct == b.offsetPct && a.needed == b.needed && a.capped == b.capped;
+}
+}
+
 bool RcDto::sameSettings(const RcDto& o) const {
-	return mode == o.mode && volume == o.volume && bypass == o.bypass && heater == o.heater &&
+	return pressure == o.pressure && gasWarned == o.gasWarned &&
+		sameSetup(pressPos, o.pressPos) && sameSetup(pressNeg, o.pressNeg) &&
+		mode == o.mode && volume == o.volume && bypass == o.bypass && heater == o.heater &&
 		clean == o.clean && autoDrive == o.autoDrive && ahuLock == o.ahuLock &&
 		exhaust == o.exhaust && supply == o.supply && night == o.night && dust == o.dust &&
 		aiMode == o.aiMode && deviceId == o.deviceId &&
@@ -152,18 +171,32 @@ bool RcDto::applyUiMode(RC::UiMode m) {
 	clean = false;
 	autoDrive = false;
 	aiMode = false;
+	pressure = RC::PRESS_NONE;
+	pressBoost = false;
 	switch( m ) {
 		case RC::UI_VENTILATION: break;
 		case RC::UI_BYPASS: bypass = true; break;
 		case RC::UI_CLEAN: clean = true; break;
 		case RC::UI_AUTO: autoDrive = true; break;
 		case RC::UI_AI: aiMode = true; autoDrive = AI_SETS_AUTO_BIT; break;
+		case RC::UI_POSITIVE:
+		case RC::UI_NEGATIVE:
+		case RC::UI_BP_POSITIVE:
+		case RC::UI_BP_NEGATIVE:
+			// 전열 경로 (바이패스 닫힘) 또는 바이패스 경로, 두 팬 모두 운전 (급기/배기 단독 해제)
+			pressure = (m == RC::UI_POSITIVE || m == RC::UI_BP_POSITIVE) ? RC::PRESS_POSITIVE : RC::PRESS_NEGATIVE;
+			bypass = (m == RC::UI_BP_POSITIVE || m == RC::UI_BP_NEGATIVE);
+			exhaust = false;
+			supply = false;
+			break;
 		default: return false;
 	}
 	return true;
 }
 
 RC::UiMode RcDto::uiMode() const {
+	if( pressure == RC::PRESS_POSITIVE ) return bypass ? RC::UI_BP_POSITIVE : RC::UI_POSITIVE;
+	if( pressure == RC::PRESS_NEGATIVE ) return bypass ? RC::UI_BP_NEGATIVE : RC::UI_NEGATIVE;
 	if( aiMode ) return RC::UI_AI;
 	if( bypass ) return RC::UI_BYPASS;
 	if( clean ) return RC::UI_CLEAN;
@@ -185,6 +218,60 @@ bool RcDto::isRunning() const {
 
 bool RcDto::autoActive() const {
 	return autoDrive && !aiMode;
+}
+
+bool RcDto::pressureActive() const {
+	const RC::PressureSetup* p = pressureSetup(pressure);
+	return p && p->valid;
+}
+
+const RC::PressureSetup* RcDto::pressureSetup(uint8_t kind) const {
+	if( kind == RC::PRESS_POSITIVE ) return &pressPos;
+	if( kind == RC::PRESS_NEGATIVE ) return &pressNeg;
+	return nullptr;
+}
+
+bool RcDto::pressureAirflow(uint16_t& supplyM3h, uint16_t& exhaustM3h) const {
+	if( !pressureActive() ) return false;
+	const RC::PressureSetup* p = pressureSetup(pressure);
+	supplyM3h = p->supply;
+	exhaustM3h = p->exhaust;
+	if( pressBoost && !night ) RC::pressureBoost(supplyM3h, exhaustM3h);
+	return true;
+}
+
+bool RcDto::pressureVspTable(bool supplySide, uint8_t& low, uint8_t& mid, uint8_t& high) const {
+	const RC::PressureSetup* p = pressureSetup(pressure);
+	if( !p || !p->valid ) return false;
+	uint8_t s, e;
+	RC::pressureVsp(pressure, p->supply, p->exhaust, s, e);
+	low = supplySide ? s : e;
+	uint16_t bs = p->supply, be = p->exhaust;
+	RC::pressureBoost(bs, be);
+	RC::pressureVsp(pressure, bs, be, s, e);
+	mid = supplySide ? s : e;
+	high = mid;
+	return true;
+}
+
+void RcDto::currentVsp(uint8_t& supplyVsp, uint8_t& exhaustVsp) const {
+	supplyVsp = 0;
+	exhaustVsp = 0;
+	const uint8_t v = effectiveVolume();
+	if( v < 1 || v > 3 ) return;
+	const int i = v - 1;
+	uint8_t s[3], e[3];
+	if( pressureActive() && pressureVspTable(true, s[0], s[1], s[2]) ) {
+		pressureVspTable(false, e[0], e[1], e[2]);
+	} else if( bypass ) {
+		s[0] = vspBpSupplyL; s[1] = vspBpSupplyM; s[2] = vspBpSupplyH;
+		e[0] = vspBpExhaustL; e[1] = vspBpExhaustM; e[2] = vspBpExhaustH;
+	} else {
+		s[0] = vspSupplyL; s[1] = vspSupplyM; s[2] = vspSupplyH;
+		e[0] = vspExhaustL; e[1] = vspExhaustM; e[2] = vspExhaustH;
+	}
+	supplyVsp = s[i];
+	exhaustVsp = e[i];
 }
 
 bool RcDto::hasFilterInfo() const {
@@ -225,6 +312,8 @@ bool RcDto::filterReplaceDue() const {
 
 uint8_t RcDto::effectiveVolume() const {
 	if( night ) return RC_SLEEP_FAN;
+	// 양압/음압: 전열 VSP 표 약풍 = 설정점, 중풍 = CO2 부스트 (RcController C5)
+	if( pressureActive() ) return pressBoost ? 2 : 1;
 	if( autoActive() ) return autoVolume;
 	return volume;
 }
@@ -234,9 +323,14 @@ bool RcDto::effectiveClean() const {
 	return clean;
 }
 
-void RcDto::dropAiIfOverridden() {
+void RcDto::dropRcModesIfOverridden() {
 	if( aiMode && (bypass || clean || autoDrive != (bool)AI_SETS_AUTO_BIT) ) {
 		aiMode = false;
+	}
+	// 양압/음압은 전열 또는 바이패스 + 두 팬 운전일 때만 성립 (MAIN 이 바이패스를 바꾸면 경로만 바뀜)
+	if( pressure != RC::PRESS_NONE && (clean || autoDrive || exhaust || supply) ) {
+		pressure = RC::PRESS_NONE;
+		pressBoost = false;
 	}
 }
 
@@ -295,7 +389,7 @@ bool RcDto::structConverter(const PLC::d5e5b5& packet) {
 				break;
 		}
 	}
-	dropAiIfOverridden();
+	dropRcModesIfOverridden();
 	return !sameSettings(before);
 }
 
@@ -325,7 +419,7 @@ bool RcDto::structConverter(const PLC::d7e7b7& packet) {
 	supply = (v & PLC::SUPPLY_D7) != 0;
 	night = (v & PLC::SLEEP_D7) != 0;
 	autoDrive = (v & PLC::AUTO_D7) != 0;
-	dropAiIfOverridden();
+	dropRcModesIfOverridden();
 	return !sameSettings(before);
 }
 

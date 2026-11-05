@@ -40,6 +40,7 @@
 #include "ui/ui_lang.h"
 #include "ui/ui_main_screen.h"
 #include "ui/ui_main_screen_v2.h"
+#include "ui/ui_main_screen_v3.h"
 #include "ui/ui_settings_screen.h"
 #include "ui/ui_theme.h"
 
@@ -99,8 +100,10 @@ using ui_lang::tr;
 
 static lv_obj_t *s_dashA = nullptr;      // circular gauges
 static lv_obj_t *s_dashB = nullptr;      // trend chart
+static lv_obj_t *s_dashC = nullptr;      // light glass design
 static lv_obj_t *s_settingsScreen = nullptr;
-static int s_dashIndex = 0;              // 0 = dash A, 1 = dash B
+static int s_dashIndex = 0;              // 0 = dash A, 1 = dash B, 2 = dash C
+constexpr int kDashCount = 3;
 
 // Set after a language change: the dashboards still show the old language
 // and are rebuilt the next time one is shown.
@@ -118,7 +121,8 @@ static void showDashboard() {
     refreshLocalSensors();
     logLvMem("after dashboard rebuild");
   }
-  lv_scr_load(s_dashIndex == 0 ? s_dashA : s_dashB);
+  lv_obj_t *const dash[kDashCount] = {s_dashA, s_dashB, s_dashC};
+  lv_scr_load(dash[s_dashIndex]);
 }
 
 static bool settingsIsOpen() {
@@ -137,13 +141,13 @@ static AQI::Result refreshAirIndex(const RC::SensorCache &cache) {
   const char *label = tr(labelKo[r.level], labelEn[r.level]);
   ui_main_screen::set_aqi(shown, label, colors[r.level]);
   ui_main_screen_v2::set_aqi(shown, label, colors[r.level]);
+  ui_main_screen_v3::set_aqi(shown, (int)r.level);
   return r;
 }
 
 // Pushes the RC's own sensor readings into both dashboards (both stay
 // alive, only one is on screen) and into the controller's cache for the
-// B6/B7/B8 replies. TVOC is ug/m3 and CO is ppm, the units of the ERV
-// internal protocol (B6 / B8).
+// B6/B7/B8 replies. TVOC on the wire is ug/m3; the dashboard shows ppb.
 static void refreshLocalSensors() {
   RC::SensorCache cache;
   cache.hasTemp = sensors::hasTemp();
@@ -153,6 +157,7 @@ static void refreshLocalSensors() {
   cache.co2 = cache.hasCo2 ? sensors::getCo2Ppm() : -1;
   cache.hasVoc = sensors::hasVocRaw();
   cache.tvoc = cache.hasVoc ? sensors::getTvocUg() : -1;
+  const int tvocPpb = cache.hasVoc ? sensors::getTvocPpb() : -1;
   cache.hasPm = sensors::hasPm();
   cache.pm25 = cache.hasPm ? sensors::getPm25Ug() : -1;
   cache.pm10 = cache.hasPm ? sensors::getPm10Ug() : -1;
@@ -166,8 +171,11 @@ static void refreshLocalSensors() {
                             cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
   ui_main_screen_v2::set_indoor(cache.hasTemp ? cache.tempC : -99.0f,
                                cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
+  ui_main_screen_v3::set_indoor(cache.hasTemp ? cache.tempC : -99.0f,
+                               cache.hasTemp ? (int)(cache.humidity + 0.5f) : -1);
+  ui_main_screen_v3::set_sensors(cache.pm25, cache.pm10, cache.co2, tvocPpb, cache.co);
   ui_dashboard_chrome::set_co2(cache.co2);
-  ui_dashboard_chrome::set_tvoc(cache.tvoc);
+  ui_dashboard_chrome::set_tvoc(tvocPpb);
   ui_dashboard_chrome::set_pm25((float)cache.pm25);
   ui_dashboard_chrome::set_pm10((float)cache.pm10);
   ui_dashboard_chrome::set_co(cache.co);
@@ -177,6 +185,8 @@ static void refreshLocalSensors() {
                                   sensors::getHour24(), sensors::getMinute());
     ui_settings_screen::set_time(sensors::getYear(), sensors::getMonth(), sensors::getDay(),
                                  sensors::getHour24(), sensors::getMinute());
+    ui_main_screen_v3::set_time(sensors::getYear(), sensors::getMonth(), sensors::getDay(),
+                                sensors::getHour24(), sensors::getMinute());
   }
   RcController::instance().setLocalSensors(cache);
   const AQI::Result aqi = refreshAirIndex(cache);
@@ -195,8 +205,10 @@ static void refreshLocalSensors() {
 }
 
 static const char *modeBadge(const RcDto &rc) {
-  static const char *names[RC::UI_MODE_COUNT] = {"전열교환", "바이패스", "청정", "자동", "AI 모드"};
-  static const char *namesEn[RC::UI_MODE_COUNT] = {"HEAT RECOVERY", "BYPASS", "CLEAN", "AUTO", "AI"};
+  static const char *names[RC::UI_MODE_COUNT] = {"전열교환", "바이패스", "청정", "자동", "AI 모드",
+                                                 "양압 모드", "음압 모드", "바이패스 양압", "바이패스 음압"};
+  static const char *namesEn[RC::UI_MODE_COUNT] = {"HEAT RECOVERY", "BYPASS", "CLEAN", "AUTO", "AI",
+                                                   "POSITIVE", "NEGATIVE", "BYPASS POSITIVE", "BYPASS NEGATIVE"};
   if (!rc.isRunning()) return tr("정지", "OFF");
   if (rc.autoActive() && rc.effectiveClean()) return tr("자동 청정", "AUTO CLEAN");
   return tr(names[rc.uiMode()], namesEn[rc.uiMode()]);
@@ -212,41 +224,70 @@ static void uiRefresh(const RcDto &rc) {
   ui_main_screen::set_fan_level(vol);
   ui_main_screen_v2::set_fan_level(vol);
 
-  // VSP for the active fan step (약/중/강) and current 전열/바이패스 set.
+  // Dashboard C: mode buttons, per-fan state (급기모드 = supply only,
+  // 배기모드 = exhaust only, fan error bits from D5 Data4), reservation.
+  static const char *modeBtn[RC::UI_MODE_COUNT] = {"전열 모드", "바이패스", "청정모드", "자동모드", "AI 모드",
+                                                   "양압 모드", "음압 모드", "바이패스 양압", "바이패스 음압"};
+  static const char *modeBtnEn[RC::UI_MODE_COUNT] = {"Ventilation", "Bypass", "Clean", "Auto", "AI Mode",
+                                                     "Positive mode", "Negative mode", "Bypass positive",
+                                                     "Bypass negative"};
+  const RC::UiMode uiMode = rc.uiMode();
+  // Pressure modes: "양압 모드 +8%" and a second line with both airflows
+  // (+ CO2 boost) - the pressure-mode status the spec asks for.
+  uint16_t supM3h = 0, exhM3h = 0;
+  if (rc.pressureAirflow(supM3h, exhM3h)) {
+    const RC::PressureSetup *ps = rc.pressureSetup(rc.pressure);
+    const bool pos = rc.pressure == RC::PRESS_POSITIVE;
+    char title[40], detail[64];
+    snprintf(title, sizeof(title), "%s %c%u%%", tr(modeBtn[uiMode], modeBtnEn[uiMode]), pos ? '+' : '-',
+             (unsigned)ps->offsetPct);
+    if (rc.pressBoost)  // keep it inside the 178 px button
+      snprintf(detail, sizeof(detail), "%s %u / %u m³/h", tr("CO₂ 부스트", "CO₂ boost"), (unsigned)supM3h,
+               (unsigned)exhM3h);
+    else
+      snprintf(detail, sizeof(detail), "%s %u · %s %u m³/h", tr("급기", "Supply"), (unsigned)supM3h,
+               tr("배기", "Exhaust"), (unsigned)exhM3h);
+    ui_main_screen_v3::set_mode(title, rc.isRunning(), detail);
+  } else {
+    ui_main_screen_v3::set_mode(tr(modeBtn[uiMode], modeBtnEn[uiMode]), rc.isRunning(), "");
+  }
+  const int fanLevel = rc.isRunning() ? vol : 0;
+  ui_main_screen_v3::set_fan(fanLevel, rc.errCode & (PLC::SUPPLY_FAN_ERR | PLC::EXHAUST_FAN_ERR));
+  if (rc.mode == RC::START_RESERVE) ui_main_screen_v3::set_reservation(1, rc.startMin);
+  else if (rc.mode == RC::STOP_RESERVE) ui_main_screen_v3::set_reservation(2, rc.stopMin);
+  else ui_main_screen_v3::set_reservation(0, 0);
+
+  // VSP for the active fan step (약/중/강) and current 전열/바이패스 set
+  // (pressure modes: the setpoint table the RC sent to MAIN).
   uint8_t supplyVsp = 0;
   uint8_t exhaustVsp = 0;
-  if (vol >= 1 && vol <= 3) {
-    const int i = vol - 1;
-    if (rc.bypass) {
-      const uint8_t s[3] = {rc.vspBpSupplyL, rc.vspBpSupplyM, rc.vspBpSupplyH};
-      const uint8_t e[3] = {rc.vspBpExhaustL, rc.vspBpExhaustM, rc.vspBpExhaustH};
-      supplyVsp = s[i];
-      exhaustVsp = e[i];
-    } else {
-      const uint8_t s[3] = {rc.vspSupplyL, rc.vspSupplyM, rc.vspSupplyH};
-      const uint8_t e[3] = {rc.vspExhaustL, rc.vspExhaustM, rc.vspExhaustH};
-      supplyVsp = s[i];
-      exhaustVsp = e[i];
-    }
-  }
+  rc.currentVsp(supplyVsp, exhaustVsp);
   ui_main_screen::set_fan_vsp(supplyVsp, exhaustVsp);
   ui_main_screen_v2::set_fan_vsp(supplyVsp, exhaustVsp);
+  // Dashboard C: "--" for a fan that is stopped (OFF, 배기모드 -> supply off,
+  // 급기모드 -> exhaust off).
+  ui_main_screen_v3::set_fan_vsp((fanLevel && !rc.exhaust) ? supplyVsp : 0,
+                                 (fanLevel && !rc.supply) ? exhaustVsp : 0);
 
   // Old RC error codes (SHR-L2 2.7): E1 supply fan, E2 exhaust fan, E3 both.
   const bool supErr = rc.errCode & PLC::SUPPLY_FAN_ERR;
   const bool exhErr = rc.errCode & PLC::EXHAUST_FAN_ERR;
-  if (supErr && exhErr) ui_dashboard_chrome::set_filter_status("E3", false);
-  else if (supErr) ui_dashboard_chrome::set_filter_status("E1", false);
-  else if (exhErr) ui_dashboard_chrome::set_filter_status("E2", false);
-  else if (rc.errCode & PLC::OA_FAN_ERR) ui_dashboard_chrome::set_filter_status("FAN ERR", false);
+  const char *status = tr("필터 정상", "Filter OK");
+  bool statusOk = false;
+  if (supErr && exhErr) status = "E3";
+  else if (supErr) status = "E1";
+  else if (exhErr) status = "E2";
+  else if (rc.errCode & PLC::OA_FAN_ERR) status = "FAN ERR";
   else if (rc.filterReplaceDue()) // MAIN's alarm bit, or the RC's own 2,000 h count
-    ui_dashboard_chrome::set_filter_status(tr("필터 교체", "Replace filter"), false);
-  else if (rc.errCode & PLC::FILTER_CLEAN_ALARM)
-    ui_dashboard_chrome::set_filter_status(tr("필터 청소", "Clean filter"), false);
-  else ui_dashboard_chrome::set_filter_status(tr("필터 정상", "Filter OK"), true);
+    status = tr("필터 교체", "Replace filter");
+  else if (rc.errCode & PLC::FILTER_CLEAN_ALARM) status = tr("필터 청소", "Clean filter");
+  else statusOk = true;
+  ui_dashboard_chrome::set_filter_status(status, statusOk);
+  ui_main_screen_v3::set_filter_status(status, statusOk);
 
   if (rc.rxMask & RC::RX_D5) {
     ui_dashboard_chrome::set_weather(tr("외기", "Outdoor"), (float)rc.outdoorTemp);
+    ui_main_screen_v3::set_weather(tr("외기", "Outdoor"), (float)rc.outdoorTemp);
   }
   ui_settings_screen::set_state(rc);
 }
@@ -266,18 +307,23 @@ static void logLvMem(const char *what) {
 static void buildDashboards() {
   if (s_dashA) lv_obj_del(s_dashA);
   if (s_dashB) lv_obj_del(s_dashB);
+  if (s_dashC) lv_obj_del(s_dashC);
   ui_dashboard_chrome::reset();
   s_dashA = lv_obj_create(NULL);
   ui_main_screen::create(s_dashA);
   s_dashB = lv_obj_create(NULL);
   ui_main_screen_v2::create(s_dashB);
+  s_dashC = lv_obj_create(NULL);
+  ui_main_screen_v3::create(s_dashC);
   ui_dashboard_chrome::set_wifi_connected(WifiController::instance().getState().connected());
+  ui_main_screen_v3::set_wifi_connected(WifiController::instance().getState().connected());
   s_dashStale = false;
 }
 
 // WifiController data callback - UI task only.
 static void wifiRefresh(const WifiDto &wifi) {
   ui_dashboard_chrome::set_wifi_connected(wifi.connected());
+  ui_main_screen_v3::set_wifi_connected(wifi.connected());
   ui_settings_screen::set_wifi_state(wifi);
 }
 
@@ -356,11 +402,11 @@ static void onButtonPress(touch::Button b) {
       lv_scr_load(s_settingsScreen);
       break;
     case touch::Button::Left:
-      s_dashIndex = 0;
+      s_dashIndex = (s_dashIndex + kDashCount - 1) % kDashCount;
       showDashboard();
       break;
     case touch::Button::Right:
-      s_dashIndex = 1;
+      s_dashIndex = (s_dashIndex + 1) % kDashCount;
       showDashboard();
       break;
     default:

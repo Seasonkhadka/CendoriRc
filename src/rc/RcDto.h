@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "io/PLCStruct.h"
+#include "RcPressure.h"
 
 namespace RC {
 
@@ -17,10 +18,13 @@ namespace RC {
 	const uint8_t VSP_MAX = 110;		// 0.05V 단위, 미만이어야 유효 (5.5V)
 
 	// 모드 열 (하나만 선택, 풍량/전원/잠금은 그대로)
+	// 양압 / 음압: RC 전용 (MAIN 에는 전열 또는 바이패스 + 급기/배기 VSP 차이, RcPressure)
+	// UI_POSITIVE / UI_NEGATIVE = 전열 경로, UI_BP_POSITIVE / UI_BP_NEGATIVE = 바이패스 경로
 	enum UiMode {
-		UI_VENTILATION = 0, UI_BYPASS, UI_CLEAN, UI_AUTO, UI_AI
+		UI_VENTILATION = 0, UI_BYPASS, UI_CLEAN, UI_AUTO, UI_AI, UI_POSITIVE, UI_NEGATIVE,
+		UI_BP_POSITIVE, UI_BP_NEGATIVE
 	};
-	const uint8_t UI_MODE_COUNT = 5;
+	const uint8_t UI_MODE_COUNT = 9;
 
 	// rxMask: 한 번이라도 수신한 프레임
 	enum RxMask {
@@ -69,6 +73,10 @@ public:
 	bool night;			// 취침모드
 	bool dust;				// 먼지제거
 	bool aiMode;			// AI 모드 (RC 전용, 프로토콜에 없음)
+	uint8_t pressure;		// RC::PressureKind - 양압 / 음압 모드 (RC 전용), 경로 = bypass
+	RC::PressureSetup pressPos;	// 양압 설정점 (마법사 결과, NVS "press")
+	RC::PressureSetup pressNeg;	// 음압 설정점
+	bool gasWarned;		// 음압 가스기기 경고 표시함 (한 번만)
 	uint8_t deviceId;		// B5 Data1 (사용자 선택 1~99, 기본 DEFAULT_DEVICE_ID)
 	uint16_t startMin;		// 가동예약 시간 (분, 10분 단위, MAX 1440)
 	uint16_t stopMin;		// 정지예약 시간 (분, 10분 단위, MAX 1440)
@@ -89,6 +97,7 @@ public:
 	// ---- 자동 모드 결과 (RC 계산, 저장 안 함) ----
 	uint8_t autoVolume;	// Table 4 풍량 (0: 정지)
 	bool autoClean;		// Table 4 청정 여부
+	bool pressBoost;		// 양압/음압 CO2 부스트 동작 중 (RC 계산, 저장 안 함)
 
 	// ---- MAIN 수신값 (표시 전용) ----
 	uint8_t errCode;		// D5 Data4 (Err_D5)
@@ -161,6 +170,21 @@ public:
 	 * @brief RC 자동 모드 동작 중 (자동, AI 아님)
 	 */
 	bool autoActive() const;
+
+	/**
+	 * @brief 양압 / 음압 모드 동작 중 (설정점 있음)
+	 */
+	bool pressureActive() const;
+
+	/**
+	 * @brief 현재 (또는 kind 의) 양압 / 음압 설정점, 없으면 nullptr
+	 */
+	const RC::PressureSetup* pressureSetup(uint8_t kind) const;
+
+	/**
+	 * @brief 지금 목표 급기 / 배기 풍량 (부스트 반영). 양압/음압 아니면 false
+	 */
+	bool pressureAirflow(uint16_t& supplyM3h, uint16_t& exhaustM3h) const;
 
 	/**
 	 * @brief 표시할 필터 값이 있음 (MAIN D6 수신 또는 RC 자체 계산)
@@ -245,11 +269,22 @@ public:
 	 */
 	PLC::d5e5b5 makeB5(bool ctrlFlag) const;
 
-private:
 	/**
-	 * @brief MAIN 이 모드 비트를 바꿔 AI 와 맞지 않으면 AI 해제
+	 * @brief MAIN (또는 급기/배기 단독 기능) 이 모드 비트를 바꿔 AI / 양압 / 음압과
+	 *        맞지 않으면 해제
 	 */
-	void dropAiIfOverridden();
+	void dropRcModesIfOverridden();
+
+	/**
+	 * @brief 양압/음압 때 MAIN 에 보내는 전열 VSP 표 (C5): 약 = 설정점, 중/강 = CO2 부스트
+	 * @param supplySide true: 급기, false: 배기
+	 */
+	bool pressureVspTable(bool supplySide, uint8_t& low, uint8_t& mid, uint8_t& high) const;
+
+	/**
+	 * @brief 지금 운전 단계의 급기 / 배기 VSP (표시용, 양압/음압이면 위 표, 아니면 일반 표)
+	 */
+	void currentVsp(uint8_t& supplyVsp, uint8_t& exhaustVsp) const;
 };
 
 #endif

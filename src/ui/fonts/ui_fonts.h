@@ -20,6 +20,9 @@ LV_FONT_DECLARE(ui_font_xs);   /* 14px regular - units, tick labels          */
 LV_FONT_DECLARE(ui_font_sm);   /* 18px regular - body text                   */
 LV_FONT_DECLARE(ui_font_md);   /* 22px bold    - emphasized values           */
 LV_FONT_DECLARE(ui_font_xxl);  /* 34px bold    - hero temperature readout    */
+LV_FONT_DECLARE(ui_font_hero); /* 50px bold    - digits only, dashboard C temp */
+LV_FONT_DECLARE(ui_font_aqi);  /* 32px regular - "AQI" + digits, dashboard C   */
+LV_FONT_DECLARE(ui_font_tiny); /* 12px regular - Latin only, dashboard C pills */
 
 #ifdef __cplusplus
 }

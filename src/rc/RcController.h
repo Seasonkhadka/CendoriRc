@@ -35,14 +35,29 @@ public:
 	bool setPowerState(bool powerOn);
 
 	/**
-	 * @brief "ventilation", "bypass", "clean", "auto", "ai" - 모드 비트만 변경
-	 *        전원 Off 상태에서는 거부 (구 RC 2.4.1)
+	 * @brief "ventilation", "bypass", "clean", "auto", "ai", "positive", "negative",
+	 *        "bypass_positive", "bypass_negative"
+	 *        - 모드 비트만 변경. 전원 Off 상태에서는 거부 (구 RC 2.4.1)
+	 *        양압 / 음압은 설정점이 없으면 거부 (UI 가 먼저 마법사를 연다)
 	 */
 	bool setModeState(const std::string& mode);
 
 	/**
+	 * @brief 양압 / 음압 설정 마법사 [적용]: 설정점 저장 후 그 모드 시작
+	 *        (전원 Off / 잠금이면 저장만). bypassPath: 바이패스 경로로 시작. 계산 결과는 out
+	 * @return 모드가 시작되었으면 true
+	 */
+	bool applyPressureSetup(uint8_t kind, uint8_t room, uint8_t count, bool bypassPath,
+				RC::PressureSetup* out = nullptr);
+
+	/**
+	 * @brief 음압 가스기기 경고를 보여줌 (한 번만 표시, NVS)
+	 */
+	void markGasWarned();
+
+	/**
 	 * @brief "1" ~ "3" - 풍량만 변경 (정지는 전원 Off)
-	 *        자동 / 취침 중에는 거부 (구 RC 2.6.1, 2.3.6)
+	 *        자동 / 취침 / 양압 / 음압 중에는 거부 (구 RC 2.6.1, 2.3.6)
 	 */
 	bool setVolumeState(const std::string& volume);
 
@@ -133,6 +148,8 @@ private:
 	void markLocalChange();
 	bool setVsp(bool bypass, const std::string* volts);
 	bool evaluateAuto();		// 자동 모드 결과 갱신, 바뀌면 true
+	bool evaluatePressureBoost();	// 양압/음압 CO2 부스트 갱신, 바뀌면 true
+	void syncPressureVsp(bool force);	// MAIN 전열 VSP 표: 양압/음압 표 <-> 원래 표 (C5 대기)
 
 	void countFilterTime();				// UI 태스크: RC 자체 필터 사용시간 (분)
 	void saveFilterMinutes(uint32_t minutes);
@@ -140,8 +157,8 @@ private:
 
 	void notifyUi();		// UI 갱신 요청만 등록 (어느 태스크에서든 호출 가능)
 	void dispatchUi();		// UI 태스크: 상태 복사 후 콜백
-	void saveSettings(const RcDto& dto);
-	bool loadSettings(RcDto& dto);
+	void saveSettings(const RcDto& dto, uint8_t vspSkew);
+	bool loadSettings(RcDto& dto, uint8_t& vspSkew);
 
 	SemaphoreHandle_t m_mutex;
 	RcDto m_dto;
@@ -156,6 +173,9 @@ private:
 	uint8_t m_resvState;		// ReserveState
 	uint8_t m_resvSel;			// B5_RUN_RSV_TM / B5_STOP_RSV_TM
 	uint8_t m_vspPending;		// VspPending 비트
+	uint8_t m_vspSkew;			// MAIN 에 양압/음압 표가 있는 VSP 세트: 0 없음, 1 전열, 2 바이패스 (NVS 저장, 정전 후 복구용)
+	uint32_t m_co2HighMs;		// CO2 > 부스트 기준 시작 시각 (0: 아님)
+	uint32_t m_co2LowMs;		// CO2 < 해제 기준 시작 시각 (0: 아님)
 	bool m_nvsDirty;
 	uint32_t m_lastChangeMs;
 

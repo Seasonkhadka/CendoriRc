@@ -44,11 +44,35 @@
 #define RC_RESERVE_TX_MAX				(RC_RESERVE_MAX_MIN / RC_RESERVE_TX_UNIT_MIN)
 #define RC_SLEEP_FAN					1		// 취침모드는 항상 약풍
 
-// ---- 자동 모드 (RC 가 CO2 / 미세먼지로 풍량, 환기/청정 결정 - 구 RC Table 4) ----
+// ---- 자동 모드 (RC 가 CO2 / 미세먼지로 풍량, 전열 /청정 결정 - 구 RC Table 4) ----
 #define RC_AUTO_MIN_HOLD_MS				10000	// 자동 결과 변경 최소 간격 (깜빡임 방지)
-#define RC_AUTO_NO_SENSOR_FAN			1		// CO2, 미세먼지 둘 다 값 없을 때 풍량 (환기)
+#define RC_AUTO_NO_SENSOR_FAN			1		// CO2, 미세먼지 둘 다 값 없을 때 풍량 (전열 )
 #define RC_AUTO_PM_USES_PM10			1		// 미세먼지 상태 = PM2.5 / PM10 중 나쁜 값
 #define RC_AUTO_CLEAN_SETS_CLEAN_BIT	1		// 자동 청정이면 B5 청정 비트 설정
+
+// ---- 양압 / 음압 모드 (RC 전용, 프로토콜에 없음 - RcPressure) ----
+// MAIN 에는 B5 = 전열 모드 (바이패스 닫힘), 급기 / 배기 풍량 차이는 전열 VSP 표를
+// C5 로 바꿔서 만든다: 약풍 = 설정점, 중풍 = CO2 부스트, 강풍 = 부스트와 같음.
+// 모드 해제 시 원래 전열 VSP 표를 다시 C5 로 보낸다. (MAIN 이 C5 를 저장하는지 미확인)
+#define RC_FAN_RATED_M3H				500		// 정격 풍량 m3/h (미확인 - 기종별 값으로 바꿀 것)
+#define RC_FAN_VSP_AT_ZERO				10		// 풍량 0 에 해당하는 VSP (0.05V 단위, 0.5V) (미확인, 선형 가정)
+#define RC_FAN_VSP_AT_RATED				108		// 정격 풍량 VSP (0.05V 단위, 5.4V) (미확인)
+#define RC_PRESS_MIN_M3H				50		// 큰 쪽 팬 최소 풍량
+#define RC_PRESS_ROUND_M3H				5		// 풍량 반올림 단위 (작은 쪽 팬과 최소 이만큼 차이)
+#define RC_PRESS_PER_PERSON_M3H			32		// 1인당 필요 풍량 (사무실 / 회의실)
+#define RC_PRESS_PER_TOILET_M3H			90		// 변기 1개당 배기 풍량 (화장실)
+#define RC_PRESS_OPEN_OFFICE_PCT		8		// 개방형 사무실 양압 %
+#define RC_PRESS_MEETING_PCT			5		// 회의실 양압 %
+#define RC_PRESS_PRIVATE_PCT			5		// 개인 사무실 양압 %
+#define RC_PRESS_RESTROOM_PCT			10		// 화장실 음압 %
+#define RC_PRESS_OTHER_NEG_PCT			10		// 기타 공간 음압 %
+#define RC_PRESS_CO2_BOOST				1		// RC CO2 센서로 부스트 (센서 없으면 동작 안 함)
+#define RC_PRESS_CO2_HIGH_PPM			1000	// 이 값 초과가
+#define RC_PRESS_CO2_HIGH_MS			(5UL * 60 * 1000)	// 이 시간 계속되면 부스트
+#define RC_PRESS_CO2_LOW_PPM			800		// 이 값 미만이
+#define RC_PRESS_CO2_LOW_MS				(10UL * 60 * 1000)	// 이 시간 계속되면 부스트 해제
+#define RC_PRESS_BOOST_PCT				20		// 부스트 = 두 팬 모두 +20% (비율 유지, 정격 이하)
+#define RC_PRESS_IGNORE_A6_WHILE_SKEWED	1		// 양압/음압 VSP 를 MAIN 에 보낸 동안 A6 전열 VSP 무시 (원래 표 보존)
 
 // ---- 실내 종합 공기질 지수 (AirIndex, 0~500, 최악 항목) ----
 #define RC_AQI_USE_TVOC					1		// TVOC ug/m3 (VOC Index 환산) 를 mg/m3 표에 넣음

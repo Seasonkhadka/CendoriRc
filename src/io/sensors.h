@@ -47,6 +47,7 @@ bool hasVocRaw();
 uint16_t getVocRaw(); // raw SGP40 signal ticks - NOT a calibrated index
 int getVocIndex();    // Sensirion VOC Index, 1-500 (100 = normal baseline) - valid whenever hasVocRaw() is
 int getTvocUg();      // TVOC ug/m3 converted from the VOC Index (protocol B6 / D9 unit)
+int getTvocPpb();     // TVOC ppb from the same VOC Index (UI unit)
 
 bool hasRtc();
 // Sets the MCP7940 RTC (24-hour, local time) and re-reads it. Call from the

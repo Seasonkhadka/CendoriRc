@@ -21,13 +21,13 @@ namespace RC {
 
 	typedef struct {
 		uint8_t volume;	// 0: 정지, 1~3
-		bool clean;		// false: 환기, true: 청정
+		bool clean;		// false: 전열 , true: 청정
 	} AutoResult;
 
 	/**
-	 * @brief Table 4: CO2 와 미세먼지 중 나쁜 상태로 풍량 / 환기·청정 결정
+	 * @brief Table 4: CO2 와 미세먼지 중 나쁜 상태로 풍량 / 전열 ·청정 결정
 	 *
-	 * 값이 없는 센서는 좋음으로 본다. 둘 다 없으면 RC_AUTO_NO_SENSOR_FAN 환기.
+	 * 값이 없는 센서는 좋음으로 본다. 둘 다 없으면 RC_AUTO_NO_SENSOR_FAN 전열 .
 	 */
 	AutoResult autoDecide(bool hasCo2, int co2, bool hasPm, int pm25, int pm10);
 }

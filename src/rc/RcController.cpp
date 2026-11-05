@@ -38,9 +38,69 @@ enum FlagBit {
 	FB_LOCK = 0x10, FB_EXHAUST = 0x20, FB_SUPPLY = 0x40, FB_NIGHT = 0x80
 };
 
-enum FlagBit2 {
-	FB2_DUST = 0x01, FB2_AI = 0x02
+// m_vspSkew
+enum VspSkew {
+	SKEW_NONE = 0, SKEW_HEAT = 1, SKEW_BYPASS = 2
 };
+
+enum FlagBit2 {
+	FB2_DUST = 0x01, FB2_AI = 0x02, FB2_POSITIVE = 0x04, FB2_NEGATIVE = 0x08, FB2_VSP_SKEWED = 0x10,
+	FB2_VSP_SKEWED_BP = 0x20
+};
+
+// 양압 / 음압 설정점 (NVS "press", 설정 blob 과 별도 - 기존 blob 형식 유지)
+const char* NVS_PRESS_KEY = "press";
+const uint8_t NVS_PRESS_VERSION = 1;
+
+typedef struct {
+	uint8_t valid;
+	uint8_t room;
+	uint8_t count;
+	uint8_t offsetPct;
+	uint8_t capped;
+	uint8_t supplyLo, supplyHi;
+	uint8_t exhaustLo, exhaustHi;
+	uint8_t neededLo, neededHi;
+} PressBlobSetup;
+
+typedef struct {
+	uint8_t version;
+	uint8_t gasWarned;
+	PressBlobSetup pos;
+	PressBlobSetup neg;
+} PressBlob;
+
+void packSetup(const RC::PressureSetup& p, PressBlobSetup& b) {
+	b.valid = p.valid;
+	b.room = p.room;
+	b.count = p.count;
+	b.offsetPct = p.offsetPct;
+	b.capped = p.capped;
+	b.supplyLo = (uint8_t)(p.supply & 0xFF);
+	b.supplyHi = (uint8_t)(p.supply >> 8);
+	b.exhaustLo = (uint8_t)(p.exhaust & 0xFF);
+	b.exhaustHi = (uint8_t)(p.exhaust >> 8);
+	b.neededLo = (uint8_t)(p.needed & 0xFF);
+	b.neededHi = (uint8_t)(p.needed >> 8);
+}
+
+RC::PressureSetup unpackSetup(const PressBlobSetup& b, uint8_t kind) {
+	RC::PressureSetup p = {};
+	int n = 0;
+	RC::pressureRooms(kind, n);
+	p.supply = (uint16_t)(b.supplyLo | (b.supplyHi << 8));
+	p.exhaust = (uint16_t)(b.exhaustLo | (b.exhaustHi << 8));
+	p.needed = (uint16_t)(b.neededLo | (b.neededHi << 8));
+	p.room = b.room;
+	p.count = b.count;
+	p.offsetPct = b.offsetPct;
+	p.capped = b.capped != 0;
+	// 저장값 검증: 방향이 맞고 정격 이하일 때만 사용
+	const bool dirOk = (kind == RC::PRESS_POSITIVE) ? p.supply > p.exhaust : p.exhaust > p.supply;
+	p.valid = b.valid && b.room < n && dirOk && p.supply <= RC_FAN_RATED_M3H && p.exhaust <= RC_FAN_RATED_M3H;
+	if( !p.valid ) p = RC::PressureSetup();
+	return p;
+}
 
 class Guard {
 public:
@@ -92,6 +152,9 @@ RcController::RcController()
 	  m_resvState(RESV_NONE),
 	  m_resvSel(PLC::B5_RUN_RSV_TM),
 	  m_vspPending(0),
+	  m_vspSkew(SKEW_NONE),
+	  m_co2HighMs(0),
+	  m_co2LowMs(0),
 	  m_nvsDirty(false),
 	  m_lastChangeMs(0),
 	  m_refreshPending(true),
@@ -108,14 +171,27 @@ void RcController::init() {
 	}
 
 	RcDto loaded;
-	const bool ok = (err == ESP_OK) && loadSettings(loaded);
+	uint8_t skewed = SKEW_NONE;
+	const bool ok = (err == ESP_OK) && loadSettings(loaded, skewed);
 	if( !ok ) {
 		loaded.setDefaults();
+		skewed = SKEW_NONE;
 	}
 	loaded.filterUsedMin = (err == ESP_OK) ? loadFilterMinutes() : 0;
+	if( loaded.pressure != RC::PRESS_NONE && !loaded.pressureActive() ) loaded.pressure = RC::PRESS_NONE;
 	{
 		Guard g(m_mutex);
 		m_dto = loaded;
+		m_vspSkew = skewed;
+		// 정전 후: 양압/음압이면 그 VSP 표를 다시 보내고, 아니면서 MAIN 에 양압/음압 표가
+		// 남아 있으면 원래 표를 보냄
+		if( m_dto.pressureActive() || m_vspSkew != SKEW_NONE ) syncPressureVsp(true);
+	}
+	if( loaded.pressureActive() ) {
+		const RC::PressureSetup* p = loaded.pressureSetup(loaded.pressure);
+		LOGI("Resume %s%s mode: supply %u exhaust %u m3/h", loaded.bypass ? "bypass " : "",
+			loaded.pressure == RC::PRESS_POSITIVE ? "positive" : "negative",
+			(unsigned)p->supply, (unsigned)p->exhaust);
 	}
 	LOGI("RC settings %s: mode=%u vol=%u id=0x%02X", ok ? "loaded" : "defaults",
 		(unsigned)loaded.mode, (unsigned)loaded.volume, (unsigned)loaded.deviceId);
@@ -160,6 +236,10 @@ bool RcController::setModeState(const std::string& mode) {
 	else if( mode == "clean" ) m = RC::UI_CLEAN;
 	else if( mode == "auto" ) m = RC::UI_AUTO;
 	else if( mode == "ai" ) m = RC::UI_AI;
+	else if( mode == "positive" ) m = RC::UI_POSITIVE;
+	else if( mode == "negative" ) m = RC::UI_NEGATIVE;
+	else if( mode == "bypass_positive" ) m = RC::UI_BP_POSITIVE;
+	else if( mode == "bypass_negative" ) m = RC::UI_BP_NEGATIVE;
 	else {
 		LOGE("Unknown mode: %s", mode.c_str());
 		return false;
@@ -171,9 +251,20 @@ bool RcController::setModeState(const std::string& mode) {
 			LOGW("Mode change ignored: power off");
 			return false;
 		}
+		if( m == RC::UI_POSITIVE || m == RC::UI_NEGATIVE || m == RC::UI_BP_POSITIVE || m == RC::UI_BP_NEGATIVE ) {
+			const bool pos = (m == RC::UI_POSITIVE || m == RC::UI_BP_POSITIVE);
+			const RC::PressureSetup* p = m_dto.pressureSetup(pos ? RC::PRESS_POSITIVE : RC::PRESS_NEGATIVE);
+			if( !p || !p->valid ) {
+				LOGW("Mode change ignored: %s not set up", mode.c_str());
+				return false;
+			}
+		}
+		const bool exh = m_dto.exhaust, sup = m_dto.supply;
 		m_dto.applyUiMode(m);	// 모드 비트만 변경, 풍량/전원/잠금/히터 유지
+		if( (exh != m_dto.exhaust || sup != m_dto.supply) && RC_SEND_FUNCTION_FRAME ) m_funcPending = true;
 		markLocalChange();
 		evaluateAuto();
+		syncPressureVsp(true);	// 양압/음압 표 전송, 또는 다른 모드면 원래 표로 복귀
 	}
 	notifyUi();
 	return true;
@@ -188,14 +279,122 @@ bool RcController::setVolumeState(const std::string& volume) {
 	{
 		Guard g(m_mutex);
 		if( lockedOut(false) ) return false;
-		if( m_dto.autoActive() || m_dto.night ) {
-			LOGW("Fan change ignored: %s", m_dto.night ? "sleep" : "auto");
+		if( m_dto.autoActive() || m_dto.night || m_dto.pressureActive() ) {
+			LOGW("Fan change ignored: %s", m_dto.night ? "sleep" : (m_dto.pressureActive() ? "pressure" : "auto"));
 			return false;
 		}
 		m_dto.setVolume((uint8_t)v);	// 풍량만 변경, 모드 유지
 		markLocalChange();
 	}
 	notifyUi();
+	return true;
+}
+
+bool RcController::applyPressureSetup(uint8_t kind, uint8_t room, uint8_t count, bool bypassPath,
+				RC::PressureSetup* out) {
+	const RC::PressureSetup r = RC::pressureCompute(kind, room, count);
+	if( out ) *out = r;
+	if( !r.valid ) {
+		LOGE("Pressure setup invalid: kind=%u room=%u", (unsigned)kind, (unsigned)room);
+		return false;
+	}
+	bool started = false;
+	{
+		Guard g(m_mutex);
+		if( kind == RC::PRESS_POSITIVE ) m_dto.pressPos = r;
+		else m_dto.pressNeg = r;
+		m_nvsDirty = true;
+		m_lastChangeMs = millis();
+		if( !lockedOut(false) && m_dto.isRunning() ) {
+			const bool exh = m_dto.exhaust, sup = m_dto.supply;
+			const bool pos = kind == RC::PRESS_POSITIVE;
+			m_dto.applyUiMode(bypassPath ? (pos ? RC::UI_BP_POSITIVE : RC::UI_BP_NEGATIVE)
+										: (pos ? RC::UI_POSITIVE : RC::UI_NEGATIVE));
+			if( (exh != m_dto.exhaust || sup != m_dto.supply) && RC_SEND_FUNCTION_FRAME ) m_funcPending = true;
+			markLocalChange();
+			evaluateAuto();
+			started = true;
+		}
+		syncPressureVsp(true);	// 이미 그 모드로 운전 중이면 새 설정점 전송
+	}
+	LOGI("Pressure setup %s: supply %u exhaust %u m3/h (%c%u%%)%s%s",
+		kind == RC::PRESS_POSITIVE ? "positive" : "negative", (unsigned)r.supply, (unsigned)r.exhaust,
+		kind == RC::PRESS_POSITIVE ? '+' : '-', (unsigned)r.offsetPct,
+		r.capped ? " capped to rated" : "", started ? ", started" : ", saved only");
+	notifyUi();
+	return started;
+}
+
+void RcController::markGasWarned() {
+	{
+		Guard g(m_mutex);
+		if( m_dto.gasWarned ) return;
+		m_dto.gasWarned = true;
+		m_nvsDirty = true;
+		m_lastChangeMs = millis();
+	}
+	notifyUi();
+}
+
+// MAIN 의 VSP 표를 맞춤: 양압/음압이면 그 경로 (전열 / 바이패스) 세트에 양압/음압 표,
+// 다른 세트는 원래 표 (C5, 팬 1개당 1프레임).
+// force: 양압/음압 표를 다시 보냄 (진입, 설정점 변경, 부팅)
+void RcController::syncPressureVsp(bool force) {
+	const uint8_t want = !m_dto.pressureActive() ? SKEW_NONE : (m_dto.bypass ? SKEW_BYPASS : SKEW_HEAT);
+	if( want == SKEW_NONE ) {
+		m_dto.pressBoost = false;
+		m_co2HighMs = 0;
+		m_co2LowMs = 0;
+	}
+	if( want == m_vspSkew && !(force && want != SKEW_NONE) ) return;
+	if( RC_SEND_C5_ON_VSP_CHANGE ) {
+		// 원래 표로 되돌릴 세트 + 양압/음압 표를 보낼 세트
+		const uint8_t sets[2] = { m_vspSkew, want };
+		for( uint8_t set : sets ) {
+			if( set == SKEW_HEAT ) m_vspPending |= VSP_PEND_EXHAUST | VSP_PEND_SUPPLY;
+			if( set == SKEW_BYPASS ) m_vspPending |= VSP_PEND_BP_EXHAUST | VSP_PEND_BP_SUPPLY;
+		}
+	}
+	if( want != m_vspSkew ) {
+		static const char* names[3] = { "normal", "pressure on heat-exchange set", "pressure on bypass set" };
+		m_vspSkew = want;
+		m_nvsDirty = true;
+		m_lastChangeMs = millis();
+		LOGI("VSP table -> %s", names[want]);
+	}
+}
+
+// 양압/음압 CO2 부스트: > HIGH ppm 이 HIGH_MS 계속 -> 부스트, < LOW ppm 이 LOW_MS 계속 -> 해제
+bool RcController::evaluatePressureBoost() {
+	if( !RC_PRESS_CO2_BOOST || !m_dto.pressureActive() || !m_sensor.hasCo2 ) {
+		m_co2HighMs = 0;
+		m_co2LowMs = 0;
+		if( m_dto.pressBoost ) {
+			m_dto.pressBoost = false;
+			m_ctrlPending = RC_CTRL_FLAG_ON_LOCAL_CHANGE;
+			return true;
+		}
+		return false;
+	}
+	const uint32_t now = millis() | 1;	// 0 = 타이머 없음
+	const int co2 = m_sensor.co2;
+	if( !m_dto.pressBoost ) {
+		m_co2LowMs = 0;
+		if( co2 <= RC_PRESS_CO2_HIGH_PPM ) { m_co2HighMs = 0; return false; }
+		if( !m_co2HighMs ) m_co2HighMs = now;
+		if( now - m_co2HighMs < RC_PRESS_CO2_HIGH_MS ) return false;
+		m_dto.pressBoost = true;
+	} else {
+		m_co2HighMs = 0;
+		if( co2 >= RC_PRESS_CO2_LOW_PPM ) { m_co2LowMs = 0; return false; }
+		if( !m_co2LowMs ) m_co2LowMs = now;
+		if( now - m_co2LowMs < RC_PRESS_CO2_LOW_MS ) return false;
+		m_dto.pressBoost = false;
+	}
+	m_co2HighMs = 0;
+	m_co2LowMs = 0;
+	m_ctrlPending = RC_CTRL_FLAG_ON_LOCAL_CHANGE;	// 풍량 단계 1 <-> 2
+	LOGI("Pressure CO2 boost %s (co2=%d)", m_dto.pressBoost ? "on" : "off", co2);
 	return true;
 }
 
@@ -311,11 +510,12 @@ bool RcController::setVsp(bool bypass, const std::string* volts) {
 		uint8_t* sH = bypass ? &m_dto.vspBpSupplyH : &m_dto.vspSupplyH;
 		if( *eH != u[0] || *eM != u[1] || *eL != u[2] ) {
 			*eH = u[0]; *eM = u[1]; *eL = u[2];
-			if( RC_SEND_C5_ON_VSP_CHANGE ) m_vspPending |= bypass ? VSP_PEND_BP_EXHAUST : VSP_PEND_EXHAUST;
+			// 양압/음압 중에는 MAIN 의 그 세트에 양압/음압 표가 있음 - 원래 표는 모드 해제 때 전송
+			if( RC_SEND_C5_ON_VSP_CHANGE && m_vspSkew != (bypass ? SKEW_BYPASS : SKEW_HEAT) ) m_vspPending |= bypass ? VSP_PEND_BP_EXHAUST : VSP_PEND_EXHAUST;
 		}
 		if( *sH != u[3] || *sM != u[4] || *sL != u[5] ) {
 			*sH = u[3]; *sM = u[4]; *sL = u[5];
-			if( RC_SEND_C5_ON_VSP_CHANGE ) m_vspPending |= bypass ? VSP_PEND_BP_SUPPLY : VSP_PEND_SUPPLY;
+			if( RC_SEND_C5_ON_VSP_CHANGE && m_vspSkew != (bypass ? SKEW_BYPASS : SKEW_HEAT) ) m_vspPending |= bypass ? VSP_PEND_BP_SUPPLY : VSP_PEND_SUPPLY;
 		}
 		m_nvsDirty = true;
 		m_lastChangeMs = millis();
@@ -396,6 +596,8 @@ bool RcController::setFunctionState(const std::string& func, bool on) {
 		if( funcFrame && RC_SEND_FUNCTION_FRAME ) {
 			m_funcPending = true;
 		}
+		m_dto.dropRcModesIfOverridden();	// 급기/배기 단독 -> 양압/음압 해제
+		syncPressureVsp(false);
 		markLocalChange();
 	}
 	notifyUi();
@@ -413,13 +615,14 @@ void RcController::setLocalSensors(const RC::SensorCache& sensor) {
 		Guard g(m_mutex);
 		m_sensor = sensor;
 		changed = evaluateAuto();
+		changed = evaluatePressureBoost() || changed;
 	}
 	if( changed ) {
 		notifyUi();
 	}
 }
 
-// 구 RC 2.4.5 / Table 4: 자동 모드에서 RC 가 풍량, 환기/청정 결정
+// 구 RC 2.4.5 / Table 4: 자동 모드에서 RC 가 풍량, 전열 /청정 결정
 bool RcController::evaluateAuto() {
 	if( !m_dto.autoActive() ) {
 		m_autoValid = false;
@@ -495,17 +698,19 @@ void RcController::uiTick() {
 	}
 
 	bool save = false;
+	uint8_t skewed = SKEW_NONE;
 	RcDto copy;
 	{
 		Guard g(m_mutex);
 		if( m_nvsDirty && millis() - m_lastChangeMs >= RC_NVS_SAVE_DELAY_MS ) {
 			m_nvsDirty = false;
 			copy = m_dto;
+			skewed = m_vspSkew;
 			save = true;
 		}
 	}
 	if( save ) {
-		saveSettings(copy);
+		saveSettings(copy, skewed);
 	}
 }
 
@@ -574,6 +779,15 @@ void RcController::handleFrame(const uint8_t frame[6]) {
 				changed = m_dto.structConverter(PlcService::fromBytes<PLC::d9>(frame));
 				break;
 			case PLC::A6:
+				// 양압/음압 표를 보낸 동안 MAIN 이 되돌려 주는 그 세트의 VSP 는 무시 (원래 표 보존)
+				if( RC_PRESS_IGNORE_A6_WHILE_SKEWED &&
+					((m_vspSkew == SKEW_HEAT &&
+					  (frame[1] == PLC::VSP_EXHAUST_HEAT_EXCH || frame[1] == PLC::VSP_SUPPLY_HEAT_EXCH)) ||
+					 (m_vspSkew == SKEW_BYPASS &&
+					  (frame[1] == PLC::VSP_EXHAUST_BYPASS || frame[1] == PLC::VSP_SUPPLY_BYPASS))) ) {
+					m_dto.rxMask |= RC::RX_A6;
+					return;
+				}
 				changed = m_dto.structConverter(PlcService::fromBytes<PLC::a6>(frame));
 				break;
 			default:
@@ -583,6 +797,7 @@ void RcController::handleFrame(const uint8_t frame[6]) {
 			m_nvsDirty = true;
 			m_lastChangeMs = millis();
 			evaluateAuto();	// MAIN 이 자동 진입/해제했을 수 있음
+			syncPressureVsp(false);	// MAIN 이 모드를 바꿔 양압/음압이 해제됐을 수 있음
 		}
 	}
 	notifyUi();
@@ -604,28 +819,33 @@ bool RcController::buildReply(uint8_t header, uint8_t out[6]) {
 	switch( header ) {
 		case PLC::D5: {
 			// 우선순위: C5 (VSP) -> 예약 시간 B5 -> 필터 B5 -> Function B5 -> 일반 B5
+			// 전열 표: 양압/음압이면 그 설정점 표 (약 = 설정점, 중/강 = 부스트), 아니면 원래 표
 			if( m_vspPending & VSP_PEND_EXHAUST ) {
 				m_vspPending &= ~VSP_PEND_EXHAUST;
-				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_EXHAUST_HEAT_EXCH,
-					m_dto.vspExhaustL, m_dto.vspExhaustM, m_dto.vspExhaustH), out);
+				uint8_t l = m_dto.vspExhaustL, m = m_dto.vspExhaustM, h = m_dto.vspExhaustH;
+				if( m_vspSkew == SKEW_HEAT ) m_dto.pressureVspTable(false, l, m, h);
+				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_EXHAUST_HEAT_EXCH, l, m, h), out);
 				return true;
 			}
 			if( m_vspPending & VSP_PEND_SUPPLY ) {
 				m_vspPending &= ~VSP_PEND_SUPPLY;
-				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_SUPPLY_HEAT_EXCH,
-					m_dto.vspSupplyL, m_dto.vspSupplyM, m_dto.vspSupplyH), out);
+				uint8_t l = m_dto.vspSupplyL, m = m_dto.vspSupplyM, h = m_dto.vspSupplyH;
+				if( m_vspSkew == SKEW_HEAT ) m_dto.pressureVspTable(true, l, m, h);
+				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_SUPPLY_HEAT_EXCH, l, m, h), out);
 				return true;
 			}
 			if( m_vspPending & VSP_PEND_BP_EXHAUST ) {
 				m_vspPending &= ~VSP_PEND_BP_EXHAUST;
-				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_EXHAUST_BYPASS,
-					m_dto.vspBpExhaustL, m_dto.vspBpExhaustM, m_dto.vspBpExhaustH), out);
+				uint8_t l = m_dto.vspBpExhaustL, m = m_dto.vspBpExhaustM, h = m_dto.vspBpExhaustH;
+				if( m_vspSkew == SKEW_BYPASS ) m_dto.pressureVspTable(false, l, m, h);
+				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_EXHAUST_BYPASS, l, m, h), out);
 				return true;
 			}
 			if( m_vspPending & VSP_PEND_BP_SUPPLY ) {
 				m_vspPending &= ~VSP_PEND_BP_SUPPLY;
-				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_SUPPLY_BYPASS,
-					m_dto.vspBpSupplyL, m_dto.vspBpSupplyM, m_dto.vspBpSupplyH), out);
+				uint8_t l = m_dto.vspBpSupplyL, m = m_dto.vspBpSupplyM, h = m_dto.vspBpSupplyH;
+				if( m_vspSkew == SKEW_BYPASS ) m_dto.pressureVspTable(true, l, m, h);
+				PlcService::toBytes(PlcService::makeC5(PLC::C5_VSP_SUPPLY_BYPASS, l, m, h), out);
 				return true;
 			}
 			if( m_resvState == RESV_READY ) {
@@ -676,7 +896,7 @@ bool RcController::buildReply(uint8_t header, uint8_t out[6]) {
 	}
 }
 
-void RcController::saveSettings(const RcDto& dto) {
+void RcController::saveSettings(const RcDto& dto, uint8_t vspSkew) {
 	SettingsBlob blob;
 	blob.version = NVS_VERSION;
 	blob.mode = dto.mode;
@@ -690,7 +910,16 @@ void RcController::saveSettings(const RcDto& dto) {
 		(dto.exhaust   ? FB_EXHAUST : 0) |
 		(dto.supply    ? FB_SUPPLY  : 0) |
 		(dto.night     ? FB_NIGHT   : 0));
-	blob.flags2 = (uint8_t)((dto.dust ? FB2_DUST : 0) | (dto.aiMode ? FB2_AI : 0));
+	blob.flags2 = (uint8_t)((dto.dust ? FB2_DUST : 0) | (dto.aiMode ? FB2_AI : 0) |
+		(dto.pressure == RC::PRESS_POSITIVE ? FB2_POSITIVE : 0) |
+		(dto.pressure == RC::PRESS_NEGATIVE ? FB2_NEGATIVE : 0) |
+		(vspSkew == SKEW_HEAT ? FB2_VSP_SKEWED : 0) |
+		(vspSkew == SKEW_BYPASS ? FB2_VSP_SKEWED_BP : 0));
+	PressBlob press = {};
+	press.version = NVS_PRESS_VERSION;
+	press.gasWarned = dto.gasWarned;
+	packSetup(dto.pressPos, press.pos);
+	packSetup(dto.pressNeg, press.neg);
 	blob.deviceId = dto.deviceId;
 	blob.startMinLo = (uint8_t)(dto.startMin & 0xFF);
 	blob.startMinHi = (uint8_t)(dto.startMin >> 8);
@@ -717,13 +946,16 @@ void RcController::saveSettings(const RcDto& dto) {
 	}
 	esp_err_t err = nvs_set_blob(h, NVS_KEY, &blob, sizeof(blob));
 	if( err == ESP_OK ) {
+		err = nvs_set_blob(h, NVS_PRESS_KEY, &press, sizeof(press));
+	}
+	if( err == ESP_OK ) {
 		err = nvs_commit(h);
 	}
 	nvs_close(h);
 	LOGI("RC settings saved: %s", err == ESP_OK ? "ok" : esp_err_to_name(err));
 }
 
-bool RcController::loadSettings(RcDto& dto) {
+bool RcController::loadSettings(RcDto& dto, uint8_t& vspSkew) {
 	nvs_handle_t h;
 	if( nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK ) {
 		return false;
@@ -731,6 +963,10 @@ bool RcController::loadSettings(RcDto& dto) {
 	SettingsBlob blob;
 	size_t len = sizeof(blob);
 	const esp_err_t err = nvs_get_blob(h, NVS_KEY, &blob, &len);
+	PressBlob press = {};
+	size_t plen = sizeof(press);
+	const bool pressOk = nvs_get_blob(h, NVS_PRESS_KEY, &press, &plen) == ESP_OK &&
+		plen == sizeof(press) && press.version == NVS_PRESS_VERSION;
 	nvs_close(h);
 	if( err != ESP_OK || len != sizeof(blob) || blob.version != NVS_VERSION ) {
 		return false;
@@ -759,6 +995,15 @@ bool RcController::loadSettings(RcDto& dto) {
 	dto.night = blob.flags & FB_NIGHT;
 	dto.dust = blob.flags2 & FB2_DUST;
 	dto.aiMode = blob.flags2 & FB2_AI;
+	if( pressOk ) {
+		dto.pressPos = unpackSetup(press.pos, RC::PRESS_POSITIVE);
+		dto.pressNeg = unpackSetup(press.neg, RC::PRESS_NEGATIVE);
+		dto.gasWarned = press.gasWarned != 0;
+	}
+	dto.pressure = (blob.flags2 & FB2_POSITIVE) ? RC::PRESS_POSITIVE :
+		((blob.flags2 & FB2_NEGATIVE) ? RC::PRESS_NEGATIVE : RC::PRESS_NONE);
+	vspSkew = (blob.flags2 & FB2_VSP_SKEWED) ? SKEW_HEAT :
+		((blob.flags2 & FB2_VSP_SKEWED_BP) ? SKEW_BYPASS : SKEW_NONE);
 	dto.deviceId = blob.deviceId;
 	dto.startMin = startMin;
 	dto.stopMin = stopMin;

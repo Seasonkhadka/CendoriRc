@@ -317,4 +317,69 @@ lv_obj_t *disconnect(lv_obj_t *parent, lv_coord_t size, lv_color_t color) {
   return b;
 }
 
+// ---- pressure-mode icons ---------------------------------------------------
+// Points live on the heap and are freed with the line object (the settings
+// panel rebuilds its content on every refresh).
+
+static void free_points(lv_event_t *e) {
+  delete[] static_cast<lv_point_t *>(lv_event_get_user_data(e));
+}
+
+static void seg(lv_obj_t *parent, lv_coord_t x1, lv_coord_t y1, lv_coord_t x2, lv_coord_t y2, lv_coord_t w,
+                lv_color_t color) {
+  lv_point_t *pts = new lv_point_t[2]{{x1, y1}, {x2, y2}};
+  lv_obj_t *l = lv_line_create(parent);
+  lv_line_set_points(l, pts, 2);
+  lv_obj_set_style_line_width(l, w, 0);
+  lv_obj_set_style_line_color(l, color, 0);
+  lv_obj_set_style_line_rounded(l, true, 0);
+  lv_obj_add_event_cb(l, free_points, LV_EVENT_DELETE, pts);
+}
+
+// Horizontal arrow from (x_from, y) to (x_to, y), head at x_to.
+static void arrow(lv_obj_t *parent, lv_coord_t x_from, lv_coord_t x_to, lv_coord_t y, lv_coord_t head,
+                  lv_coord_t w, lv_color_t color) {
+  seg(parent, x_from, y, x_to, y, w, color);
+  const lv_coord_t back = x_to > x_from ? x_to - head : x_to + head;
+  seg(parent, x_to, y, back, y - head, w, color);
+  seg(parent, x_to, y, back, y + head, w, color);
+}
+
+// Room outline in the middle with one arrow on each side: pointing away from
+// the room (out = true, positive pressure) or into it (negative pressure).
+static lv_obj_t *pressure(lv_obj_t *parent, lv_coord_t size, lv_color_t color, bool out) {
+  lv_obj_t *b = box(parent, size);
+  const lv_coord_t w = LV_MAX(2, size / 12);
+  const lv_coord_t room = (lv_coord_t)(size * 0.40f);
+  lv_obj_t *r = lv_obj_create(b);
+  lv_obj_remove_style_all(r);
+  lv_obj_set_size(r, room, room);
+  lv_obj_set_style_border_width(r, w, 0);
+  lv_obj_set_style_border_color(r, color, 0);
+  lv_obj_set_style_radius(r, LV_MAX(2, size / 14), 0);
+  lv_obj_center(r);
+
+  const lv_coord_t cy = size / 2;
+  const lv_coord_t inner_l = (size - room) / 2 - w;      // just outside the room
+  const lv_coord_t inner_r = (size + room) / 2 + w;
+  const lv_coord_t outer_l = w, outer_r = size - 1 - w;  // box edge
+  const lv_coord_t head = LV_MAX(2, size / 9);
+  if (out) {
+    arrow(b, inner_l, outer_l, cy, head, w, color);
+    arrow(b, inner_r, outer_r, cy, head, w, color);
+  } else {
+    arrow(b, outer_l, inner_l, cy, head, w, color);
+    arrow(b, outer_r, inner_r, cy, head, w, color);
+  }
+  return b;
+}
+
+lv_obj_t *pressure_out(lv_obj_t *parent, lv_coord_t size, lv_color_t color) {
+  return pressure(parent, size, color, true);
+}
+
+lv_obj_t *pressure_in(lv_obj_t *parent, lv_coord_t size, lv_color_t color) {
+  return pressure(parent, size, color, false);
+}
+
 } // namespace ui_icons

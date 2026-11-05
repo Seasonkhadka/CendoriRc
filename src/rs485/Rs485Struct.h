@@ -77,7 +77,7 @@ namespace RS485 {
 	typedef struct __attribute__((packed)) {
 		uint8_t header = 0;		// 위 Header
 		uint8_t group = 0;		// 그룹 ID (중앙제어기)
-		uint8_t id = 0;			// 개별 ID (환기장치)
+		uint8_t id = 0;			// 개별 ID (전열 장치)
 		uint8_t d[6] = {};		// D0 ~ D5
 		uint8_t checksum = 0;	// HEADER ~ D5 XOR
 	} Frame;

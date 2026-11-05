@@ -16,10 +16,11 @@ UI guide – screens, keys and messages of the room controller
    - 2.2 대시보드 A
    - 2.3 대시보드 B
    - 2.4 하단 바
+   - 2.5 대시보드 C
 3. 버튼 동작
 4. 설정 화면
    - 4.1 공통 구성
-   - 4.2 풍량 설정
+   - 4.2 풍량 설정 (양압 / 음압 설정 마법사)
    - 4.3 예약 설정
    - 4.4 네트워크 설정
    - 4.5 기기 설정 (ID 설정, VSP 설정)
@@ -33,15 +34,17 @@ UI guide – screens, keys and messages of the room controller
 
 1.1 Display: 5.0" LCD, 800 × 480.
 
-1.2 The room controller has three screens:
+1.2 The room controller has four screens:
 
 | 화면 | 설명 | 여는 방법 |
 |---|---|---|
-| 대시보드 A | Air quality and fan gauges | ◀ on the dashboard |
-| 대시보드 B | Trend graph and fan level meters | ▶ on the dashboard |
+| 대시보드 A | Air quality and fan gauges | ◀ / ▶ on a dashboard (A → B → C → A) |
+| 대시보드 B | Trend graph and fan level meters | ◀ / ▶ on a dashboard |
+| 대시보드 C | Light design: AQI ring, airflow picture, AI ventilation card | ◀ / ▶ on a dashboard |
 | 설정 | Settings menu | 설정 key on the dashboard |
 
-1.3 Both dashboards share the same top bar and bottom bar.
+1.3 대시보드 A and B share the same top bar and bottom bar (2.1, 2.4).
+대시보드 C has its own light top bar and sensor pills (2.5).
 
 1.4 Every value on the screen shows the current state of the room
 controller, which is what is sent to the main unit in the next reply.
@@ -97,7 +100,7 @@ the clock is behind by the time between build and boot.
 |---|---|
 | 정지 (OFF) | Power Off |
 | 자동 청정 (AUTO CLEAN) | Auto mode running in clean |
-| 전열교환 (HEAT RECOVERY) | 환기 mode |
+| 전열교환 (HEAT RECOVERY) | 전열 mode |
 | 바이패스 (BYPASS) | 바이패스 mode |
 | 청정 (CLEAN) | 청정 mode |
 | 자동 (AUTO) | 자동 mode |
@@ -164,6 +167,24 @@ and are not connected to data yet.
 
 "--" is shown when a sensor has no value.
 
+### 2.5 대시보드 C
+
+Light ("glass") design. The background, the airflow picture and the ring
+colours are pictures stored in the firmware (`tools/gen_dash_c_art.py`);
+everything else is live.
+
+| No. | 표시 | 설명 |
+|---|---|---|
+| (1) | 상단 바 | Same elements and size as the 대시보드 A/B top bar (2.1): Wi-Fi, weather, date and time, filter status. Light frosted bar, dark text; filter status teal when normal, red otherwise |
+| (2) | AQI | "AQI 32 EXCELLENT": AQI 0~500 and level (EXCELLENT / MODERATE / POOR / VERY POOR), in the level colour |
+| (3) | AQI 링 | Ring colour by level (blue / green / orange / red); fuller ring = cleaner air (100 − AQI ÷ 5 %) |
+| (4) | 실내 온습도 | Indoor temperature and humidity inside the ring (SHT40) |
+| (5) | 급기 / 배기 그림 + VSP | Airflow picture (fixed). Under each fan name: that fan's VSP voltage for the current fan level and 전열/바이패스 set, e.g. "2.40V" (value only). "--" when that fan is not running (unit stopped, 배기모드 = supply fan off, 급기모드 = exhaust fan off) |
+| (6) | 모드 버튼 | One button with the current mode: 전열 모드 / 바이패스 / 청정모드 / 자동모드 / AI 모드 / 양압 모드 / 음압 모드 / 바이패스 양압 / 바이패스 음압. In 양압 / 음압: "양압 모드 +8%" and a small second line "급기 320 · 배기 295 m³/h" ("CO₂ 부스트 384 / 354 m³/h" during the boost). Lit while running, dim when stopped. Display only |
+| (7) | 풍량 | One fan row (the main unit has one shared fan speed). Bar = fan level (약 / 중 / 강 = 1/3, 2/3, full), level name on the right (정지 / 약 / 중 / 강). Red icon and "오류" on a supply or exhaust fan error from the main unit |
+| (8) | 예약 | 가동예약 / 정지예약 and the reservation time, or 예약 없음 |
+| (9) | 하단 카드 | Same six cards as the 대시보드 A/B bottom bar (2.4): PM2.5, PM10, CO₂, TVOC, CO, Temp (temperature and humidity), same units. Pastel pills, no shadow |
+
 ---
 
 ## 3. 버튼 동작
@@ -172,8 +193,8 @@ and are not connected to data yet.
 |---|---|---|
 | 전원 | Power On / Off (backlight follows) | Same |
 | 설정 | Open the settings screen | – |
-| ◀ | Show 대시보드 A | Change the value of the selected row |
-| ▶ | Show 대시보드 B | Change the value of the selected row |
+| ◀ | Previous dashboard (C → B → A → C) | Change the value of the selected row |
+| ▶ | Next dashboard (A → B → C → A) | Change the value of the selected row |
 | ▲ / ▼ | – | Move between menu items or rows |
 | OK | – | Enter a menu / send or save |
 | Back | – | Cancel / leave a menu / close settings |
@@ -215,16 +236,34 @@ and are not connected to data yet.
 
 | 행 | 내용 |
 |---|---|
-| 현재 상태 | "현재 상태 (State): ON / Ventilation / Fan 2", with " / SLEEP" and " / LOCK" when active |
-| 모드 | 환기 (Vent) / 바이패스 (Bypass) / 청정 (Clean) / 자동 (Auto) / AI |
+| 현재 상태 | "현재 상태 (State): ON / Ventilation / Fan 2", with " / SLEEP" and " / LOCK" when active. In 양압 / 음압 a second line: "양압 모드 +8%  급기 320 m³/h · 배기 295 m³/h", plus " · CO₂ 부스트 동작 중" while the boost runs |
+| 모드 | 전열 (Vent) / 바이패스 (Bypass) / 청정 (Clean) / 자동 (Auto) / AI. The picked mode is the only white pill (no other indicator) |
+| 전열 방식 / 바이패스 방식 | Only when 전열 or 바이패스 is picked: 일반 (Normal, balanced) / 양압 (Positive) / 음압 (Negative) on that air path. 양압 has arrows pointing out of a room, 음압 arrows pointing in |
 | 풍량 | 약 (Low) / 중 (Mid) / 강 (High) |
+| 양압/음압 다시 설정 | Only when 전열 or 바이패스 is picked. Plain text: 양압 or 음압 with its saved offset (e.g. "양압 +8%") or "미설정 (Not set)"; shown as "< 양압 +8% >" while the row is focused |
 | 상태 줄 | Result of the last command (see 5) |
 
 4.2.1 ◀ / ▶ pick a value in the selected row. OK applies only that row and
-the panel stays open, so the other row can be set too.
+the panel stays open, so the other rows can be set too.
 
 4.2.2 The mode can be changed only while the power is On. The fan level can
-be changed only in manual mode (not in 자동 or 취침).
+be changed only in manual mode (not in 자동, 취침, 양압 or 음압).
+
+4.2.3 OK on the 모드 row or the 방식 row applies 전열 / 바이패스 with the picked
+방식 (일반 = the normal mode). A wizard started from 바이패스 starts 바이패스 양압 /
+음압 on 적용.
+
+4.2.4 양압 / 음압 설정 마법사: OK on 양압 or 음압 before it was ever set up, or OK
+on "양압/음압 다시 설정", opens the wizard in the same panel.
+
+| 단계 | 화면 | 버튼 |
+|---|---|---|
+| 1 / 3 | 공간 종류: e.g. 개방형 사무실 / 회의실 / 개인 사무실, with "1인당 32 m³/h · 양압 모드 +8%" | ◀ / ▶ room, OK next, ↩ close |
+| 2 / 3 | 인원 (명) or 변기 수 (개): [-] 10 명 [+] | ◀ / ▶ or ▲ / ▼ count, OK next, ↩ back |
+| 3 / 3 | 결과: "급기 320 m³/h · 배기 295 m³/h", "양압 모드 +8%", warnings, [적용] | OK apply, ↩ back |
+
+Nothing is sent before 적용. 적용 saves the setpoints and starts the mode. If
+the power is off or the unit is locked, the setpoints are only saved.
 
 ### 4.3 예약 설정
 
@@ -370,6 +409,10 @@ shows English only.
 | 메시지 | 위치 | 의미 |
 |---|---|---|
 | 적용됨 - 다음 응답에 전송 (Queued) | 풍량 / 예약 상태 줄 | Accepted; sent to the main unit in the next reply |
-| 무시됨 - LOCK/OFF/AUTO/취침 (Ignored) | 풍량 / 예약 상태 줄 | Not accepted (locked, power Off, auto mode or sleep mode) |
+| 무시됨 - LOCK/OFF/AUTO/취침/양압·음압 (Ignored) | 풍량 / 예약 상태 줄 | Not accepted (locked, power Off, auto mode, sleep mode, or a fan change in 양압 / 음압) |
+| 양압 모드 시작 - 설정 저장됨 (Positive mode on) | 풍량 상태 줄 | Wizard applied; the mode started with the new setpoints (same for 음압) |
+| 설정 저장됨 - 전원 Off/잠금이라 시작 안 함 (Saved - not started) | 풍량 상태 줄 | Wizard applied while the power was off or the unit was locked; setpoints saved only |
+| 필요 풍량 … 더 큰 장치를 검토하세요. (Unit too small) | 마법사 결과 | The needed airflow is above the rated airflow; it runs capped |
+| 음압 모드는 … 창문을 조금 열어 두세요. (Gas appliance) | 마법사 결과 (음압) | Shown until the first 음압 setup is applied, then never again |
 | PLC 대기 (Idle) | 풍량 / 예약 상태 줄 | No command sent yet |
 | 통신 끊김 (No link to main unit) | 풍량 / 예약 상태 줄 | No frame from the main unit for 5 seconds |
