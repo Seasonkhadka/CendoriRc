@@ -213,6 +213,13 @@ everything else is live.
 | (3) | 내용 | Right side panel of the selected menu |
 | (4) | 버튼 안내 | Footer with the key hints for the current screen |
 
+Style: same light look and colours as 대시보드 C - its soft colour patches
+(cyan, peach, lavender, mint on the cream base) scattered over the screen,
+without the airflow picture (`ui_soft_bg`, built once into PSRAM, no flash
+cost), behind frosted white cards (50 %) with a thin white rim, dark text.
+The picked menu item and the picked option are solid white with a cyan glow
+and teal text. The filter ring uses the 대시보드 C fan-bar blue.
+
 4.1.1 메뉴
 
 | 메뉴 | 내용 |

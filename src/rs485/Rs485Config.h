@@ -16,13 +16,13 @@
 
 // ---- 주소 ----
 #define RS485_GROUP					0x00	// 중앙제어기 그룹 ID (문서 0x00~0xFE). RC 에 설정 화면 없음
-#define RS485_USE_RC_DEVICE_ID		1		// 1: 개별 ID = RC 설정의 ID (기기 설정 -> ID 설정)
-#define RS485_DEFAULT_ID			0x01	// RC ID 가 0 (미설정) 일 때 사용
 #define RS485_ID_DOC_MAX			0x20	// 문서상 개별 ID 최대 (1~32) - 화면 안내용
+// 개별 ID = 기기 설정 -> ID 설정 (1~99). 미설정(0) 이면 RS-485 송수신 없음.
 
 // ---- 타이밍 ----
 #define RS485_FRAME_GAP_MS			20		// 바이트 사이 이 시간 이상 비면 프레임 버림 (1바이트 = 1.04ms)
 #define RS485_REPLY_DELAY_MS		5		// 요청 끝 -> 응답 시작 (문서에 없음)
+#define RS485_AUTO_B6_MS			1000	// 룸콘 데이터(B6) 자동 송신 주기. 0 = 끄고 D6 폴링만. 버스 유휴 시에만 송신
 
 // ---- 데이터 해석 (문서 확인 필요) ----
 #define RS485_VSP_X10				1		// 1: VSP = 전압 x10 (문서 예제: 2.3V -> 23). 0: 상위니블 V, 하위니블 0.1V (문서 본문)

@@ -24,6 +24,11 @@ public:
 	bool handleRequest(const RS485::Frame& req, RS485::Frame& out);
 
 	/**
+	 * @brief 문서 2-2 B6 (룸 컨트롤러 데이터) - 폴링 없이 자동 송신용
+	 */
+	bool buildAutoB6(RS485::Frame& out);
+
+	/**
 	 * @brief 현재 응답하는 개별 ID
 	 */
 	uint8_t myId();

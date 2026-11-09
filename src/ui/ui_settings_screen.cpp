@@ -8,6 +8,7 @@
 #include "ui_settings_screen.h"
 #include "ui_theme.h"
 #include "ui_icons.h"
+#include "ui_soft_bg.h"
 #include "fonts/ui_fonts.h"
 #include "rc/RcConfig.h"
 #include "rc/RcController.h"
@@ -26,6 +27,42 @@ using namespace ui_theme;
 using ui_lang::tr;
 
 namespace ui_settings_screen {
+
+// ---- Light "glass" palette, same look as dashboard C (ui_main_screen_v3) ----
+// These names hide the dark ui_theme colours inside this file only;
+// dashboards A / B keep ui_theme.
+constexpr uint32_t BG = 0xF2EDE4;              // dashboard C base (under the artwork)
+constexpr uint32_t BAR_FROM = 0x1E7FE0;        // dashboard C fan bar blue
+constexpr uint32_t CARD_BG = 0xFFFFFF;         // frosted white (GLASS_OPA)
+constexpr uint32_t CARD_BG_ALT = 0xFFFFFF;
+constexpr uint32_t BORDER = 0xD6DDE3;          // keys / chips outline
+constexpr uint32_t TRACK = 0xDCD3F7;           // lavender track (dashboard C fan bar)
+constexpr uint32_t TEXT_PRIMARY = 0x2F3437;
+constexpr uint32_t TEXT_SECONDARY = 0x4A4F52;
+constexpr uint32_t TEXT_DIM = 0x8C9196;
+constexpr uint32_t ACCENT_CYAN = 0x0E8A9A;     // teal accent (lit mode button text)
+constexpr uint32_t ACCENT_CYAN_DIM = 0x7FC7CF;
+constexpr uint32_t GOOD = 0x14917F;
+constexpr uint32_t WARN = 0xD97706;
+constexpr uint32_t DANGER = 0xDC2626;
+constexpr uint32_t PILL_BG = 0xFFFFFF;         // picked option: solid white ...
+constexpr uint32_t PILL_GLOW = 0x9EE7EF;       // ... with a cyan glow ...
+constexpr uint32_t PILL_TEXT = 0x0E8A9A;       // ... and teal text
+constexpr uint32_t PILL_TEXT_SUB = 0x4A4F52;
+constexpr lv_opa_t GLASS_OPA = LV_OPA_50;
+
+// No drop shadows on cards (dashboard C uses flat frosted panels).
+inline void elevate(lv_obj_t *) {}
+
+// Frosted panel: translucent white, thin white rim.
+inline void glass(lv_obj_t *o, lv_coord_t radius) {
+  lv_obj_set_style_bg_color(o, c(CARD_BG), 0);
+  lv_obj_set_style_bg_opa(o, GLASS_OPA, 0);
+  lv_obj_set_style_radius(o, radius, 0);
+  lv_obj_set_style_border_width(o, 1, 0);
+  lv_obj_set_style_border_color(o, c(0xFFFFFF), 0);
+  lv_obj_set_style_border_opa(o, LV_OPA_80, 0);
+}
 
 // Rebuilds whichever content panel is currently shown - defined further
 // down (outer namespace, alongside create()/select_menu()/etc.), but the
@@ -334,13 +371,9 @@ lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t *font, 
 }
 
 lv_obj_t *make_card(lv_obj_t *parent, uint32_t bg) {
+  (void)bg;  // every card is the same frosted glass (dashboard C)
   lv_obj_t *card = make_plain(parent);
-  lv_obj_set_style_bg_color(card, c(bg), 0);
-  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(card, 14, 0);
-  lv_obj_set_style_border_width(card, 1, 0);
-  lv_obj_set_style_border_color(card, c(BORDER), 0);
-  elevate(card);
+  glass(card, 16);
   return card;
 }
 
@@ -355,7 +388,7 @@ lv_obj_t *make_mode_option(lv_obj_t *parent, const char *main_text, const char *
   lv_obj_set_style_bg_color(pill, c(PILL_BG), 0);
   if (selected) {
     lv_obj_set_style_shadow_width(pill, 14, 0);
-    lv_obj_set_style_shadow_color(pill, c(PILL_BG), 0);
+    lv_obj_set_style_shadow_color(pill, c(PILL_GLOW), 0);
     lv_obj_set_style_shadow_opa(pill, LV_OPA_40, 0);
   }
   lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_COLUMN);
@@ -396,7 +429,7 @@ lv_obj_t *make_level_option(lv_obj_t *parent, const char *main_text, const char 
   lv_obj_set_style_bg_color(pill, c(PILL_BG), 0);
   if (selected) {
     lv_obj_set_style_shadow_width(pill, 14, 0);
-    lv_obj_set_style_shadow_color(pill, c(PILL_BG), 0);
+    lv_obj_set_style_shadow_color(pill, c(PILL_GLOW), 0);
     lv_obj_set_style_shadow_opa(pill, LV_OPA_40, 0);
   }
   lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_COLUMN);
@@ -491,6 +524,11 @@ void make_choice(lv_obj_t *parent, const char *text, bool sel, int icon) {
   lv_obj_set_style_radius(pill, 12, 0);
   lv_obj_set_style_bg_color(pill, c(PILL_BG), 0);
   lv_obj_set_style_bg_opa(pill, sel ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+  if (sel) {
+    lv_obj_set_style_shadow_width(pill, 12, 0);
+    lv_obj_set_style_shadow_color(pill, c(PILL_GLOW), 0);
+    lv_obj_set_style_shadow_opa(pill, LV_OPA_60, 0);
+  }
   lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(pill, 5, 0);
@@ -512,8 +550,8 @@ lv_obj_t *make_choice_card(lv_obj_t *parent, lv_coord_t h, const char *title, bo
   lv_obj_set_style_pad_column(card, 6, 0);
   apply_focus_frame(card, focused);
   if (title) {
-    lv_obj_t *t = make_label(card, title, &ui_font_xs, TEXT_PRIMARY);
-    lv_obj_set_width(t, 76);
+    lv_obj_t *t = make_label(card, title, &ui_font_md, TEXT_PRIMARY);
+    lv_obj_set_width(t, 118);
   }
   return card;
 }
@@ -721,7 +759,7 @@ void build_filter_panel(lv_obj_t *parent) {
   lv_obj_set_style_arc_color(ring, c(TRACK), LV_PART_MAIN);
   lv_obj_set_style_arc_rounded(ring, true, LV_PART_MAIN);
   lv_obj_set_style_arc_width(ring, 14, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_color(ring, c(ACCENT_CYAN), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(ring, c(BAR_FROM), LV_PART_INDICATOR);
   lv_obj_set_style_arc_rounded(ring, true, LV_PART_INDICATOR);
 
   char pct_buf[8];
@@ -742,7 +780,7 @@ void build_filter_panel(lv_obj_t *parent) {
 
   lv_obj_t *usage = make_plain(info);
   lv_obj_set_flex_flow(usage, LV_FLEX_FLOW_COLUMN);
-  make_label(usage, tr("누적 사용:", "Used:"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(usage, tr("누적 사용:", "Used:"), &ui_font_md, TEXT_SECONDARY);
   char hours_buf[20];
   if (have) {
     snprintf(hours_buf, sizeof(hours_buf), "%d %s", s_rc.filterUsedHours(), hours);
@@ -753,7 +791,7 @@ void build_filter_panel(lv_obj_t *parent) {
 
   lv_obj_t *replace = make_plain(info);
   lv_obj_set_flex_flow(replace, LV_FLEX_FLOW_COLUMN);
-  make_label(replace, tr("잔여 시간:", "Remaining:"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(replace, tr("잔여 시간:", "Remaining:"), &ui_font_md, TEXT_SECONDARY);
   lv_obj_t *dateRow = make_row(replace, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
   char remain_buf[20];
   if (have) snprintf(remain_buf, sizeof(remain_buf), "%d %s", remainH, hours);
@@ -970,7 +1008,7 @@ void build_wifi_scan(lv_obj_t *parent) {
 
   lv_obj_t *head = make_row(parent, LV_PCT(100), LV_SIZE_CONTENT, 8);
   lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  make_label(head, tr("주변 Wi-Fi", "Nearby networks"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(head, tr("주변 Wi-Fi", "Nearby networks"), &ui_font_md, TEXT_SECONDARY);
   if (s_wifi.scanning) make_label(head, tr("검색 중...", "Scanning..."), &ui_font_xs, WARN);
 
   if (n == 0) {
@@ -1415,7 +1453,7 @@ void build_clock_panel(lv_obj_t *parent) {
   lv_obj_set_style_pad_all(date_card, 16, 0);
   lv_obj_set_flex_flow(date_card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(date_card, 12, 0);
-  make_label(date_card, tr("일자", "Date"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(date_card, tr("일자", "Date"), &ui_font_md, TEXT_SECONDARY);
   lv_obj_t *date_row = make_row(date_card, LV_PCT(100), 80, 8);
   make_clock_field(date_row, 0, yb);
   make_label(date_row, ".", &ui_font_xxl, TEXT_DIM);
@@ -1429,7 +1467,7 @@ void build_clock_panel(lv_obj_t *parent) {
   lv_obj_set_style_pad_all(time_card, 16, 0);
   lv_obj_set_flex_flow(time_card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(time_card, 12, 0);
-  make_label(time_card, tr("시간", "Time"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(time_card, tr("시간", "Time"), &ui_font_md, TEXT_SECONDARY);
   lv_obj_t *time_row = make_row(time_card, LV_PCT(100), 80, 8);
   make_clock_field(time_row, 3, hb);
   make_label(time_row, ":", &ui_font_xxl, TEXT_DIM);
@@ -1453,7 +1491,7 @@ void build_language_panel(lv_obj_t *parent) {
   lv_obj_set_style_pad_all(card, 16, 0);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(card, 12, 0);
-  make_label(card, tr("화면 언어", "Display Language"), &ui_font_sm, TEXT_SECONDARY);
+  make_label(card, tr("화면 언어", "Display Language"), &ui_font_md, TEXT_SECONDARY);
 
   lv_obj_t *row = make_row(card, LV_PCT(100), 80, 10);
   apply_focus_frame(row, true);
@@ -1505,14 +1543,14 @@ void build_engineer_portal_panel(lv_obj_t *parent) {
   lv_obj_set_style_pad_row(card, 12, 0);
 
   ui_icons::lock(card, 28, c(TEXT_SECONDARY));
-  make_label(card, tr("기기 설정", "Engineer Mode"), &ui_font_sm, TEXT_PRIMARY);
+  make_label(card, tr("기기 설정", "Engineer Mode"), &ui_font_md, TEXT_PRIMARY);
 
   if (!s_pinOpen) {
     make_label(card, tr("OK = 4자리 PIN", "OK = 4-digit PIN"), &ui_font_xs, TEXT_DIM);
     return;
   }
 
-  make_label(card, "PIN", &ui_font_sm, TEXT_SECONDARY);
+  make_label(card, "PIN", &ui_font_md, TEXT_SECONDARY);
   make_pin_boxes(card, s_pinDigit, s_pinPos, true);
   if (s_pinWrong) make_label(card, tr("PIN 실패", "Wrong PIN"), &ui_font_sm, DANGER);
   else make_label(card, tr("* ▲▼ 변경  ◀▶ 이동  OK 확인", "* Up/Down change, Left/Right move, OK"),
@@ -1528,7 +1566,7 @@ void build_engineer_pin_panel(lv_obj_t *parent) {
   lv_obj_set_style_pad_row(card, 12, 0);
 
   ui_icons::lock(card, 28, c(TEXT_SECONDARY));
-  make_label(card, tr("PIN 변경", "Change PIN"), &ui_font_sm, TEXT_PRIMARY);
+  make_label(card, tr("PIN 변경", "Change PIN"), &ui_font_md, TEXT_PRIMARY);
 
   int digits[4] = {};
   digits_from_pin(s_in_panel ? s_data.pin : s_savedPin, digits);
@@ -1574,7 +1612,7 @@ void build_engineer_id_panel(lv_obj_t *parent) {
   make_label(minus, "-", &ui_font_md, TEXT_PRIMARY);
 
   lv_obj_t *idRow = make_row(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT, 6);
-  make_label(idRow, "ID", &ui_font_sm, TEXT_SECONDARY);
+  make_label(idRow, "ID", &ui_font_md, TEXT_SECONDARY);
   char id_buf[12];
   snprintf(id_buf, sizeof(id_buf), "[ %d ]", s_data.eng_id);
   make_label(idRow, id_buf, &ui_font_md, TEXT_PRIMARY);
@@ -1635,7 +1673,7 @@ void build_fan_voltage_card(lv_obj_t *parent, const char *header, int selected_i
   lv_obj_set_style_pad_row(card, 6, 0);
   apply_focus_frame(card, focused);
 
-  make_label(card, header, &ui_font_sm, TEXT_SECONDARY);
+  make_label(card, header, &ui_font_md, TEXT_SECONDARY);
 
   lv_obj_t *row = make_row(card, LV_PCT(100), 44, 8);
   make_voltage_option(row, high_text, selected_idx == 0);
@@ -1714,8 +1752,12 @@ void build_engineer_vsp_panel(lv_obj_t *parent) {
 
 void restyle_eng_menu_item(int idx) {
   bool selected = (idx == s_engSelected);
-  lv_obj_set_style_border_color(s_engMenuCards[idx], c(selected ? ACCENT_CYAN : BORDER), 0);
+  lv_obj_set_style_border_color(s_engMenuCards[idx], c(selected ? ACCENT_CYAN : 0xFFFFFF), 0);
   lv_obj_set_style_border_width(s_engMenuCards[idx], selected ? 2 : 1, 0);
+  lv_obj_set_style_bg_opa(s_engMenuCards[idx], selected ? LV_OPA_COVER : GLASS_OPA, 0);
+  lv_obj_set_style_shadow_width(s_engMenuCards[idx], selected ? 12 : 0, 0);
+  lv_obj_set_style_shadow_color(s_engMenuCards[idx], c(PILL_GLOW), 0);
+  lv_obj_set_style_shadow_opa(s_engMenuCards[idx], LV_OPA_60, 0);
   lv_obj_set_style_text_color(s_engMenuTitles[idx], c(selected ? ACCENT_CYAN : TEXT_PRIMARY), 0);
   if (s_engMenuSubtitles[idx]) {
     lv_obj_set_style_text_color(s_engMenuSubtitles[idx], c(selected ? ACCENT_CYAN : TEXT_SECONDARY), 0);
@@ -1801,9 +1843,15 @@ void restyle_menu_item(int idx) {
   uint32_t titleColor = selected ? ACCENT_CYAN : (item.enabled ? TEXT_PRIMARY : TEXT_DIM);
   uint32_t subColor = selected ? ACCENT_CYAN : (item.enabled ? TEXT_SECONDARY : TEXT_DIM);
 
-  lv_obj_set_style_border_color(s_menuCards[idx], c(selected ? ACCENT_CYAN : BORDER), 0);
+  // Picked item = solid white with the cyan glow (dashboard C lit button);
+  // the others are frosted glass.
+  lv_obj_set_style_border_color(s_menuCards[idx], c(selected ? ACCENT_CYAN : 0xFFFFFF), 0);
   lv_obj_set_style_border_width(s_menuCards[idx], selected ? 2 : 1, 0);
-  lv_obj_set_style_bg_color(s_menuCards[idx], c(selected ? CARD_BG : CARD_BG), 0);
+  lv_obj_set_style_bg_color(s_menuCards[idx], c(CARD_BG), 0);
+  lv_obj_set_style_bg_opa(s_menuCards[idx], selected ? LV_OPA_COVER : GLASS_OPA, 0);
+  lv_obj_set_style_shadow_width(s_menuCards[idx], selected ? 12 : 0, 0);
+  lv_obj_set_style_shadow_color(s_menuCards[idx], c(PILL_GLOW), 0);
+  lv_obj_set_style_shadow_opa(s_menuCards[idx], LV_OPA_60, 0);
 
   lv_obj_set_style_text_color(s_menuTitles[idx], c(titleColor), 0);
   if (s_menuSubtitles[idx]) lv_obj_set_style_text_color(s_menuSubtitles[idx], c(subColor), 0);
@@ -1868,18 +1916,14 @@ void update_breadcrumb() {
 void build_breadcrumb(lv_obj_t *parent) {
   lv_obj_t *bar = make_plain(parent);
   lv_obj_set_size(bar, LV_PCT(100), 52);
-  lv_obj_set_style_bg_color(bar, c(CARD_BG), 0);
-  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(bar, 14, 0);
-  lv_obj_set_style_border_width(bar, 1, 0);
-  lv_obj_set_style_border_color(bar, c(BORDER), 0);
+  glass(bar, 14);
   lv_obj_set_style_pad_hor(bar, 18, 0);
   lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
   lv_obj_t *left = make_row(bar, LV_SIZE_CONTENT, LV_PCT(100), 8);
   make_label(left, LV_SYMBOL_LEFT, &lv_font_montserrat_20, TEXT_SECONDARY);
-  s_breadcrumbRoot = make_label(left, tr("설정", "SETTINGS"), &ui_font_sm, TEXT_PRIMARY);
+  s_breadcrumbRoot = make_label(left, tr("설정", "SETTINGS"), &ui_font_md, TEXT_PRIMARY);
   make_label(left, LV_SYMBOL_RIGHT, &lv_font_montserrat_20, TEXT_DIM);
   s_breadcrumbSection = make_label(left, menu_title(s_selected), &ui_font_sm, TEXT_SECONDARY);
 
@@ -2018,8 +2062,10 @@ lv_obj_t *create() {
   load_pin();
   lv_obj_t *scr = lv_obj_create(NULL);
   lv_obj_remove_style_all(scr);
+  // Dashboard C's soft colour patches, scattered (no airflow artwork).
   lv_obj_set_style_bg_color(scr, c(BG), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  if (const lv_img_dsc_t *bg = ui_soft_bg::get()) lv_obj_set_style_bg_img_src(scr, bg, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_all(scr, 14, 0);

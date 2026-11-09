@@ -28,15 +28,12 @@ Rs485Controller& Rs485Controller::instance() {
 }
 
 uint8_t Rs485Controller::myId() {
-	if( RS485_USE_RC_DEVICE_ID ) {
-		const uint8_t id = RcController::instance().getState().deviceId;
-		if( id != 0 ) return id;
-	}
-	return RS485_DEFAULT_ID;
+	return RcController::instance().getState().deviceId;
 }
 
 bool Rs485Controller::handleRequest(const RS485::Frame& req, RS485::Frame& out) {
 	const uint8_t id = myId();
+	if( id == 0 ) return false;	// 기기 설정 ID 가 있어야 응답
 	if( req.group != RS485_GROUP || req.id != id ) return false;	// 다른 장치 주소
 
 	if( RS485_ALLOW_CONTROL ) {
@@ -49,6 +46,14 @@ bool Rs485Controller::handleRequest(const RS485::Frame& req, RS485::Frame& out) 
 	}
 	RcController& rc = RcController::instance();
 	return Rs485Service::buildReply(req, RS485_GROUP, id, rc.getState(), rc.getSensors(), out);
+}
+
+bool Rs485Controller::buildAutoB6(RS485::Frame& out) {
+	const uint8_t id = myId();
+	if( id == 0 ) return false;	// 기기 설정 -> ID 설정 값이 없으면 송신하지 않음
+	Rs485Service::fillB6(RS485_GROUP, id, RcController::instance().getSensors(), out);
+	out.checksum = Rs485Service::makeChecksum(out);
+	return true;
 }
 
 // E5: D0 모드/팬 (0xFE 변화 없음), D2 필터시간, D3/D4 예약시간

@@ -22,6 +22,13 @@ namespace Rs485Service {
 	bool isRequestHeader(uint8_t header);
 
 	/**
+	 * @brief B6 룸콘 데이터 (문서 2-2): HEADER 0xB6, Group, ID,
+	 *        D0 PM10 ug/m3, D1 CO2/100, D2 CO2%100, D3 PM2.5 ug/m3,
+	 *        D4/D5 TVOC ug/m3 상위/하위, CHECKSUM = HEADER~D5 XOR
+	 */
+	void fillB6(uint8_t group, uint8_t id, const RC::SensorCache& sensor, RS485::Frame& out);
+
+	/**
 	 * @brief 요청에 대한 응답 프레임 (현재 상태 + 센서). 응답 없는 헤더면 false
 	 */
 	bool buildReply(const RS485::Frame& req, uint8_t group, uint8_t id, const RcDto& dto,

@@ -117,6 +117,19 @@ uint8_t reserveToWire(uint16_t minutes) {
 	return (uint8_t)(h > 24 ? 24 : h);
 }
 
+void fillB6(uint8_t group, uint8_t id, const RC::SensorCache& sensor, RS485::Frame& out) {
+	out = RS485::Frame();
+	out.header = RS485::B6;
+	out.group = group;
+	out.id = id;
+	uint8_t* d = out.d;
+	// 문서 2-2 MAIN→PC: D0 PM10, D1/D2 CO2 (ppm/100, ppm%100), D3 PM2.5, D4/D5 TVOC ug/m3
+	d[0] = sensor.hasPm ? clampByte(sensor.pm10) : 0;
+	if( sensor.hasCo2 ) encodeCo2(sensor.co2, d[1], d[2]);
+	d[3] = sensor.hasPm ? clampByte(sensor.pm25) : 0;
+	if( sensor.hasVoc ) encodeU16(sensor.tvoc, d[4], d[5]);
+}
+
 bool buildReply(const RS485::Frame& req, uint8_t group, uint8_t id, const RcDto& dto,
 				const RC::SensorCache& sensor, RS485::Frame& out) {
 	out = RS485::Frame();
@@ -139,11 +152,7 @@ bool buildReply(const RS485::Frame& req, uint8_t group, uint8_t id, const RcDto&
 			break;
 		}
 		case RS485::D6:
-			out.header = RS485::B6;
-			d[0] = sensor.hasPm ? clampByte(sensor.pm10) : 0;
-			if( sensor.hasCo2 ) encodeCo2(sensor.co2, d[1], d[2]);
-			d[3] = sensor.hasPm ? clampByte(sensor.pm25) : 0;
-			if( sensor.hasVoc ) encodeU16(sensor.tvoc, d[4], d[5]);	// ug/m3
+			fillB6(group, id, sensor, out);
 			break;
 		case RS485::D7:
 		case RS485::E7:
